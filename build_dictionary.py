@@ -98,7 +98,16 @@ def compact(card: dict, digital_only: set[str]) -> dict | None:
         or card.get("oracle_id") in digital_only
     ):
         return None
+    return entry(card)
 
+
+def entry(card: dict) -> dict:
+    """The dictionary fields of one Scryfall card object, with no exclusion check.
+
+    Also used to turn a ``/cards/named`` answer into a :class:`matcher.Card`.
+    """
+    name = card["name"]
+    type_line = card.get("type_line", "")
     faces = card.get("card_faces") or []
     if "image_uris" in card:
         image_urls = [card["image_uris"]["png"]]
