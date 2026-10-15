@@ -19,12 +19,15 @@ USER_AGENT = f"mtg-script-cards/{VERSION}"
 API = "https://api.scryfall.com"
 
 MIN_GAP_SECONDS = 0.1
+# /cards/named (and /cards/search) are limited to 2 requests a second.
+NAMED_GAP_SECONDS = 0.5
 DEFAULT_TIMEOUT = 60
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
 
 _last_request_at = 0.0
+_last_named_at = float("-inf")
 
 
 def _wait_for_gap() -> None:
@@ -34,6 +37,14 @@ def _wait_for_gap() -> None:
     if remaining > 0:
         time.sleep(remaining)
     _last_request_at = time.monotonic()
+
+
+def _wait_for_named_gap() -> None:
+    global _last_named_at
+    remaining = NAMED_GAP_SECONDS - (time.monotonic() - _last_named_at)
+    if remaining > 0:
+        time.sleep(remaining)
+    _last_named_at = time.monotonic()
 
 
 def get(url: str, **kwargs) -> requests.Response:
@@ -70,12 +81,31 @@ def download(url: str, dest_path: str | os.PathLike[str]) -> Path:
 
 
 def named_fuzzy(name: str) -> dict | None:
-    """Look a card up by approximate name. Returns the card JSON, or None on 404."""
+    """Look a card up by approximate name. Returns the card JSON, or None on 404.
+
+    A 404 means no card or several cards matched (``"cryptic"``). Spaced at
+    least 500 ms apart, as Scryfall asks for this endpoint. The result can be a
+    token (``"jace"``, ``"ragavan"``); check :func:`is_game_card` before using it.
+    """
+    _wait_for_named_gap()
     response = get(f"{API}/cards/named", params={"fuzzy": name})
     if response.status_code == 404:
         return None
     response.raise_for_status()
     return response.json()
+
+
+NOT_GAME_CARD_LAYOUTS = frozenset({"token", "double_faced_token", "emblem", "art_series"})
+
+
+def is_game_card(card: dict) -> bool:
+    """False for tokens, emblems and art-series cards, which have no place in a deck."""
+    type_line = card.get("type_line") or ""
+    return (
+        card.get("layout") not in NOT_GAME_CARD_LAYOUTS
+        and not type_line.startswith("Token")
+        and "Emblem" not in type_line
+    )
 
 
 def search(query: str, **params) -> Iterator[dict]:
