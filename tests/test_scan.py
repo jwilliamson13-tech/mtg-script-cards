@@ -1,6 +1,8 @@
 """Behaviour of the ``scan`` seam: which cards come out, in what order, how confident."""
 
-from matcher import Card, scan
+from pathlib import Path
+
+from matcher import Card, load_cards, load_nicknames, nickname_warnings, scan
 
 FABLE = "Fable of the Mirror-Breaker // Reflection of Kiki-Jiki"
 
@@ -354,3 +356,114 @@ def test_include_pair_keeps_what_the_user_typed():
     result = scan("nothing to see here", REVIEW_CARDS, include=[("thought seas", CARDS["Thoughtseize"])])
     [mention] = result.mentions
     assert (mention.card.name, mention.matched_text, mention.flagged) == ("Thoughtseize", "thought seas", False)
+
+
+# --- nicknames (#8) ------------------------------------------------------------
+
+NICK_CARDS = {
+    **CARDS,
+    **index_of(
+        "Lightning Bolt",
+        "Tarmogoyf",
+        "Kolaghan's Command",
+        "Library",
+        "Library of Alexandria",
+        "Jace, Vryn's Prodigy // Jace, Telepath Unbound",
+    ),
+}
+NICKS = {
+    "trop": "Tropical Island",
+    "bolt": "Lightning Bolt",
+    "goyf": "Tarmogoyf",
+    "k command": "Kolaghan's Command",
+}
+
+
+def test_nickname_trop_yields_tropical_island_confident():
+    result = scan("then I fetch the trop", NICK_CARDS, nicknames=NICKS)
+    [mention] = result.mentions
+    assert mention.card.name == "Tropical Island"
+    assert mention.matched_text == "trop"
+    assert mention.confidence == "nickname"
+    assert mention.flagged is False
+    assert [c.name for c in result.ordered_cards()] == ["Tropical Island"]
+
+
+def test_nickname_that_is_a_common_word_is_still_confident():
+    # "bolt" is in the common-word list; a nickname entry is a deliberate choice.
+    result = scan("I cast bolt on his goyf and then trop", NICK_CARDS, nicknames=NICKS)
+    assert [(m.card.name, m.confidence, m.flagged) for m in result.mentions] == [
+        ("Lightning Bolt", "nickname", False),
+        ("Tarmogoyf", "nickname", False),
+        ("Tropical Island", "nickname", False),
+    ]
+
+
+def test_multi_word_nickname_matches_as_a_phrase():
+    result = scan("K-Command your graveyard. The command zone is different", NICK_CARDS, nicknames=NICKS)
+    assert [(m.card.name, m.matched_text, m.confidence) for m in result.mentions] == [
+        ("Kolaghan's Command", "K-Command", "nickname")
+    ]
+
+
+def test_nickname_beats_a_real_card_name_of_the_same_words():
+    # "library" is also the real card Library; the nickname file says otherwise.
+    result = scan("activate library", NICK_CARDS, nicknames={"library": "Library of Alexandria"})
+    [mention] = result.mentions
+    assert (mention.card.name, mention.confidence, mention.flagged) == (
+        "Library of Alexandria",
+        "nickname",
+        False,
+    )
+
+
+def test_longer_real_name_beats_a_shorter_nickname():
+    nicks = {"library": "Library of Alexandria", "lightning": "Tarmogoyf"}
+    result = scan("with library of alexandria and lightning bolt", NICK_CARDS, nicknames=nicks)
+    assert [(m.card.name, m.confidence) for m in result.mentions] == [
+        ("Library of Alexandria", "exact"),
+        ("Lightning Bolt", "exact"),
+    ]
+
+
+def test_nickname_may_name_a_card_by_a_face_or_in_lowercase():
+    nicks = {"jvp": "Jace, Vryn's Prodigy", "bolt": "lightning bolt"}
+    result = scan("jvp into bolt", NICK_CARDS, nicknames=nicks)
+    assert [m.card.name for m in result.mentions] == [
+        "Jace, Vryn's Prodigy // Jace, Telepath Unbound",
+        "Lightning Bolt",
+    ]
+
+
+def test_nickname_with_unknown_oracle_name_warns_and_is_skipped():
+    nicks = {"trop": "Tropical Island", "bolt": "Lightnin Bolt", "": "Tarmogoyf"}
+    assert nickname_warnings(nicks, NICK_CARDS) == [
+        'nickname "bolt": no card named "Lightnin Bolt" in the card list; skipped',
+        'nickname "" has no letters or digits; skipped',
+    ]
+    result = scan("bolt the trop", NICK_CARDS, nicknames=nicks)
+    assert [(m.card.name, m.confidence) for m in result.mentions] == [("Tropical Island", "nickname")]
+
+
+def test_two_spellings_of_one_nickname_keep_the_first_and_warn():
+    nicks = {"bolt": "Lightning Bolt", "Bolt!": "Tarmogoyf"}
+    assert nickname_warnings(nicks, NICK_CARDS) == [
+        'nickname "Bolt!" reads the same as "bolt", which already means Lightning Bolt; skipped'
+    ]
+    result = scan("bolt", NICK_CARDS, nicknames=nicks)
+    assert [m.card.name for m in result.mentions] == ["Lightning Bolt"]
+
+
+def test_empty_nicknames_switch_them_off():
+    result = scan("I fetch the trop", NICK_CARDS, nicknames={})
+    assert result.mentions == []
+
+
+def test_default_is_the_bundled_nickname_file():
+    result = scan("then I fetch the trop", NICK_CARDS)
+    assert [(m.card.name, m.confidence) for m in result.mentions] == [("Tropical Island", "nickname")]
+
+
+def test_bundled_nickname_file_names_only_real_cards():
+    cards = load_cards(Path(__file__).resolve().parent.parent / "data" / "cards.json")
+    assert nickname_warnings(load_nicknames(), cards) == []

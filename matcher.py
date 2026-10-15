@@ -1,5 +1,5 @@
-"""Card matching. Pure: no network, no filesystem beyond the two loaders
-(:func:`load_cards`, :func:`load_common_words`).
+"""Card matching. Pure: no network, no filesystem beyond the loaders
+(:func:`load_cards`, :func:`load_common_words`, :func:`load_nicknames`).
 
 The seam is :func:`scan`: raw transcript text and an in-memory card index in,
 ordered mentions out. Everything that decides *which card was said* lives here.
@@ -13,6 +13,7 @@ import gzip
 import json
 import os
 import re
+import types
 import unicodedata
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -74,6 +75,34 @@ def bundled_common_words() -> frozenset[str]:
     return load_common_words(COMMON_WORDS_PATH)
 
 
+NICKNAMES_PATH = Path(__file__).resolve().parent / "data" / "nicknames.json"
+
+
+def load_nicknames(path: str | os.PathLike[str] | None = None) -> dict[str, str]:
+    """Read a nickname file: one JSON object mapping nickname to Oracle name.
+
+    ``None`` reads the bundled ``data/nicknames.json``. Raises ``ValueError``
+    (``json.JSONDecodeError`` is one) when the file is not a JSON object.
+    Entries come back as written: :func:`nickname_warnings` checks them
+    against the card list, and :func:`scan` skips the ones that fail.
+    """
+    p = NICKNAMES_PATH if path is None else Path(path)
+    with open(p, encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f'expected one JSON object like {{"trop": "Tropical Island"}}, '
+            f"found a {type(data).__name__}"
+        )
+    return data
+
+
+@functools.cache
+def bundled_nicknames() -> Mapping[str, str]:
+    """The bundled ``data/nicknames.json``, read once per process."""
+    return types.MappingProxyType(load_nicknames(NICKNAMES_PATH))
+
+
 # --- normalization ---------------------------------------------------------
 
 # A word is a run of letters/digits, with apostrophes kept inside it so that
@@ -122,18 +151,25 @@ def normalize(text: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Lookup:
-    """Normalized name -> card, plus the longest name length in words."""
+    """Normalized name -> card, normalized nickname -> card, and the longest
+    key length in words across both."""
 
     by_name: dict[str, Card]
     max_words: int
+    nicknames: dict[str, Card] = field(default_factory=dict)
 
 
-def build_lookup(cards: Mapping[str, Card] | Iterable[Card]) -> Lookup:
+def build_lookup(
+    cards: Mapping[str, Card] | Iterable[Card], nicknames: Mapping[str, str] | None = None
+) -> Lookup:
     """Key every card by its normalized full name and each normalized face name.
 
     A card's own name wins over another card's face name when the two collide
     (a face named "Stomp" never shadows a card named "Stomp"). Within the same
     tier the first card seen keeps the key.
+
+    ``nicknames`` (nickname -> Oracle name) go in a table of their own; entries
+    naming no card in ``cards`` are left out (:func:`nickname_warnings` says why).
     """
     values = list(cards.values()) if isinstance(cards, Mapping) else list(cards)
     by_name: dict[str, Card] = {}
@@ -146,8 +182,59 @@ def build_lookup(cards: Mapping[str, Card] | Iterable[Card]) -> Lookup:
             key = normalize(face)
             if key:
                 by_name.setdefault(key, card)
-    max_words = max((key.count(" ") + 1 for key in by_name), default=0)
-    return Lookup(by_name, max_words)
+    nicks, _ = _resolve_nicknames(nicknames or {}, values, by_name)
+    max_words = max((key.count(" ") + 1 for key in [*by_name, *nicks]), default=0)
+    return Lookup(by_name, max_words, nicks)
+
+
+def _resolve_nicknames(
+    nicknames: Mapping[str, str], cards: Iterable[Card], by_name: Mapping[str, Card]
+) -> tuple[dict[str, Card], list[str]]:
+    """Normalized nickname -> card, and one warning per entry left out.
+
+    The Oracle name is looked up as written, then normalized, so "lightning
+    bolt" or a face name like "Delver of Secrets" also works.
+    """
+    named = {card.name: card for card in cards}
+    table: dict[str, Card] = {}
+    first_spelling: dict[str, str] = {}
+    warnings: list[str] = []
+    for nickname, oracle in nicknames.items():
+        key = normalize(str(nickname))
+        if not key:
+            warnings.append(f'nickname "{nickname}" has no letters or digits; skipped')
+            continue
+        if not isinstance(oracle, str):
+            warnings.append(
+                f'nickname "{nickname}": expected a card name, found {oracle!r}; skipped'
+            )
+            continue
+        card = named.get(oracle) or by_name.get(normalize(oracle))
+        if card is None:
+            warnings.append(
+                f'nickname "{nickname}": no card named "{oracle}" in the card list; skipped'
+            )
+            continue
+        if key in table:
+            if table[key].name != card.name:
+                warnings.append(
+                    f'nickname "{nickname}" reads the same as "{first_spelling[key]}", '
+                    f'which already means {table[key].name}; skipped'
+                )
+            continue
+        table[key] = card
+        first_spelling[key] = str(nickname)
+    return table, warnings
+
+
+def nickname_warnings(nicknames: Mapping[str, str], cards: CardIndex) -> list[str]:
+    """One message per nickname entry that :func:`scan` will skip, in file order.
+
+    An entry is skipped when its Oracle name is not in ``cards``, when the
+    nickname has no letters or digits, or when it repeats an earlier nickname
+    (after normalizing) for a different card.
+    """
+    return _resolve_nicknames(nicknames, cards.values(), build_lookup(cards).by_name)[1]
 
 
 # --- scan ------------------------------------------------------------------
@@ -202,7 +289,16 @@ def scan(
     """Find every card mentioned in ``transcript_text``.
 
     Exact pass: over each run of segments, at each word take the longest
-    normalized card name that starts there, consume its words, move on.
+    normalized card name or nickname that starts there, consume its words,
+    move on. Nickname matches carry ``confidence="nickname"``.
+
+    ``nicknames`` maps nickname to Oracle name; None means the bundled
+    ``data/nicknames.json`` and ``{}`` switches nicknames off. Entries whose
+    Oracle name is not in ``cards`` are skipped (:func:`nickname_warnings`
+    lists them). When a nickname and a real card name are the same words, the
+    nickname wins: someone put it in the nickname file on purpose. A longer
+    real name still beats a shorter nickname ("jace the mind sculptor" over a
+    nickname "jace").
 
     Every mention then gets its confidence rule applied (:func:`is_doubtful`):
     doubtful ones come back with ``flagged=True`` and are never downloaded.
@@ -217,10 +313,10 @@ def scan(
     timestamp and ``matched_text`` set to the include text (the Oracle name for
     a bare Card).
 
-    ``decklists``, ``nicknames`` and ``fuzzy_threshold`` are part of the seam
-    for later passes and are not used yet.
+    ``decklists`` and ``fuzzy_threshold`` are part of the seam for later passes
+    and are not used yet.
     """
-    lookup = build_lookup(cards)
+    lookup = build_lookup(cards, bundled_nicknames() if nicknames is None else nicknames)
     mentions: list[Mention] = []
     for run in _runs(transcript.parse(transcript_text)):
         mentions.extend(_exact_pass(run, lookup))
@@ -264,7 +360,11 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
     i = 0
     while i < len(tokens):
         for n in range(min(lookup.max_words, len(tokens) - i), 0, -1):
-            card = lookup.by_name.get(" ".join(tokens[i : i + n]))
+            key = " ".join(tokens[i : i + n])
+            # Same words: a nickname beats a real name (see scan's docstring).
+            card, confidence = lookup.nicknames.get(key), NICKNAME
+            if card is None:
+                card, confidence = lookup.by_name.get(key), EXACT
             if card is not None:
                 start, end = words[i][1], words[i + n - 1][2]
                 lo = words[max(0, i - CONTEXT_WORDS)][1]
@@ -274,7 +374,7 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
                         card=card,
                         matched_text=text[start:end],
                         timestamp=starts[i],
-                        confidence="exact",
+                        confidence=confidence,
                         flagged=False,
                         context=" ".join(text[lo:hi].split()),
                     )
@@ -288,8 +388,8 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
 
 # --- confidence --------------------------------------------------------------
 
-# Confidence levels a mention can carry. Only "exact" is produced so far; the
-# fuzzy pass (#6), decklists (#7) and nicknames (#8) set the others, and
+# Confidence levels a mention can carry. The exact pass produces "exact" and
+# "nickname"; the fuzzy pass (#6) and decklists (#7) set the others, and
 # is_doubtful already knows what each one means.
 EXACT, DECKLIST, NICKNAME, FUZZY = "exact", "decklist", "nickname", "fuzzy"
 ALWAYS_CONFIDENT = frozenset({DECKLIST, NICKNAME})

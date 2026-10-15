@@ -4,6 +4,7 @@ Usage:
     python mtgcards.py transcript.txt
     python mtgcards.py transcript.txt --out some/folder
     python mtgcards.py transcript.txt --include "Hope" --include "thought seas"
+    python mtgcards.py transcript.txt --nicknames my_nicknames.json
     python mtgcards.py --refresh        # update the bundled card list from Scryfall
 """
 
@@ -44,6 +45,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="NAME",
         help="download this card whether or not it was matched; repeatable, or comma-separated. "
         "Misspellings are resolved through Scryfall",
+    )
+    parser.add_argument(
+        "--nicknames",
+        metavar="FILE",
+        help="nickname file to use instead of the bundled data/nicknames.json "
+        '(a JSON object: {"trop": "Tropical Island", ...})',
     )
     parser.add_argument(
         "--refresh",
@@ -222,9 +229,35 @@ def print_review(result: matcher.ScanResult, argv: list[str]) -> None:
 # --- run -----------------------------------------------------------------------
 
 
-def run(transcript_path: Path, out_dir: Path, include: list[str], argv: list[str]) -> int:
+def load_nicknames(path: str | None, cards: matcher.CardIndex) -> dict[str, str] | None:
+    """The nickname file (``--nicknames`` or the bundled one), with a warning on
+    stderr for each entry that will be skipped. None if the file is unreadable."""
+    shown = Path(path) if path else matcher.NICKNAMES_PATH
+    try:
+        nicknames = matcher.load_nicknames(path)
+    except OSError as exc:
+        print(f"Could not read the nickname file {shown}: {exc.strerror or exc}", file=sys.stderr)
+        return None
+    except ValueError as exc:
+        print(f"The nickname file {shown} is not valid: {exc}", file=sys.stderr)
+        return None
+    for warning in matcher.nickname_warnings(nicknames, cards):
+        print(f"{shown.name}: {warning}", file=sys.stderr)
+    return nicknames
+
+
+def run(
+    transcript_path: Path,
+    out_dir: Path,
+    include: list[str],
+    argv: list[str],
+    nicknames_path: str | None = None,
+) -> int:
     text = transcript_path.read_text(encoding="utf-8-sig", errors="replace")
     cards = matcher.load_cards(CARDS_PATH)
+    nicknames = load_nicknames(nicknames_path, cards)
+    if nicknames is None:
+        return 2
 
     included: list[tuple[str, matcher.Card]] = []
     unresolved = 0
@@ -240,7 +273,7 @@ def run(transcript_path: Path, out_dir: Path, include: list[str], argv: list[str
                 print(f"--include: {note}")
             included.append((name, card))
 
-    result = matcher.scan(text, cards, include=included)
+    result = matcher.scan(text, cards, nicknames=nicknames, include=included)
     ordered = result.ordered_cards()
     numbers = {card.name: i for i, card in enumerate(ordered, start=1)}
 
@@ -293,7 +326,13 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = Path(args.out)
     else:
         out_dir = transcript_path.with_name(f"{transcript_path.stem}_cards")
-    return run(transcript_path, out_dir, args.include, sys.argv[1:] if argv is None else argv)
+    return run(
+        transcript_path,
+        out_dir,
+        args.include,
+        sys.argv[1:] if argv is None else argv,
+        nicknames_path=args.nicknames,
+    )
 
 
 if __name__ == "__main__":
