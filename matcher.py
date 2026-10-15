@@ -169,21 +169,48 @@ def scan(
 ) -> ScanResult:
     """Find every card mentioned in ``transcript_text``.
 
-    Exact pass: within each transcript segment, at each word take the longest
+    Exact pass: over each run of segments, at each word take the longest
     normalized card name that starts there, consume its words, move on.
     ``decklists``, ``nicknames``, ``include`` and ``fuzzy_threshold`` are part of
     the seam for later passes and are not used yet.
     """
     lookup = build_lookup(cards)
     mentions: list[Mention] = []
-    for segment in transcript.parse(transcript_text):
-        mentions.extend(_exact_pass(segment, lookup))
+    for run in _runs(transcript.parse(transcript_text)):
+        mentions.extend(_exact_pass(run, lookup))
     return ScanResult(mentions)
 
 
-def _exact_pass(segment: transcript.Segment, lookup: Lookup) -> list[Mention]:
-    text = segment.text
-    words = _words(text)
+def _runs(segments: list[transcript.Segment]) -> list[list[transcript.Segment]]:
+    """Group segments that a card name may straddle.
+
+    Consecutive timed segments (SRT/VTT cues) form one run: cue breaks fall
+    wherever the captioner wrapped, often mid-name ("Cloudfin" / "Raptor").
+    Untimed segments are plain-text paragraphs, deliberate breaks, so each
+    stands alone.
+    """
+    runs: list[list[transcript.Segment]] = []
+    for segment in segments:
+        if runs and segment.start is not None and runs[-1][-1].start is not None:
+            runs[-1].append(segment)
+        else:
+            runs.append([segment])
+    return runs
+
+
+def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
+    # One word stream over the whole run, each word remembering the segment it
+    # came from, so a match can cross a cue break and still take the timestamp
+    # of the cue it starts in.
+    text = " ".join(segment.text for segment in run)
+    words: list[tuple[str, int, int]] = []
+    starts: list[str | None] = []
+    offset = 0
+    for segment in run:
+        for word, lo, hi in _words(segment.text):
+            words.append((word, lo + offset, hi + offset))
+            starts.append(segment.start)
+        offset += len(segment.text) + 1
     tokens = [w for w, _, _ in words]
     found: list[Mention] = []
     i = 0
@@ -198,7 +225,7 @@ def _exact_pass(segment: transcript.Segment, lookup: Lookup) -> list[Mention]:
                     Mention(
                         card=card,
                         matched_text=text[start:end],
-                        timestamp=segment.start,
+                        timestamp=starts[i],
                         confidence="exact",
                         flagged=False,
                         context=" ".join(text[lo:hi].split()),
