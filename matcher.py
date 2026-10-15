@@ -19,6 +19,8 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from rapidfuzz import fuzz, process
+
 import transcript
 
 
@@ -283,7 +285,7 @@ def scan(
     decklists=(),
     nicknames=None,
     include: Sequence[Card | str | tuple[str, Card]] = (),
-    fuzzy_threshold=88,
+    fuzzy_threshold=86,
     common_words: Collection[str] | None = None,
 ) -> ScanResult:
     """Find every card mentioned in ``transcript_text``.
@@ -300,6 +302,15 @@ def scan(
     real name still beats a shorter nickname ("jace the mind sculptor" over a
     nickname "jace").
 
+    Fuzzy pass (:func:`_fuzzy_pass`): one-to-four-word windows over the words
+    the exact pass left, compared space-stripped against space-stripped card
+    names of eight or more characters; ``fuzzy_threshold`` is the minimum
+    ``rapidfuzz.fuzz.ratio`` score. Fuzzy mentions carry ``confidence="fuzzy"``
+    and their ``score``, and are always flagged. The default of 86 was tuned on
+    the fixture transcript (issue #6): the highest value that still surfaces
+    every misheard card the fuzzy pass can reach ("Mutault" scores 87.5,
+    "thasa god of the" 86.7).
+
     Every mention then gets its confidence rule applied (:func:`is_doubtful`):
     doubtful ones come back with ``flagged=True`` and are never downloaded.
     ``common_words`` is the normalized word list behind that rule; None means
@@ -313,14 +324,15 @@ def scan(
     timestamp and ``matched_text`` set to the include text (the Oracle name for
     a bare Card).
 
-    ``decklists`` and ``fuzzy_threshold`` are part of the seam for later passes
-    and are not used yet.
+    ``decklists`` is part of the seam for a later pass and is not used yet.
     """
     lookup = build_lookup(cards, bundled_nicknames() if nicknames is None else nicknames)
+    common = bundled_common_words() if common_words is None else common_words
+    fuzzy_names = FuzzyNames(lookup, fuzzy_threshold)
     mentions: list[Mention] = []
     for run in _runs(transcript.parse(transcript_text)):
-        mentions.extend(_exact_pass(run, lookup))
-    common = bundled_common_words() if common_words is None else common_words
+        found = _exact_pass(run, lookup)
+        mentions.extend(_fuzzy_pass(run, found, fuzzy_names, common))
     mentions = [_with_confidence_rule(m, common) for m in mentions]
     return ScanResult(_apply_includes(mentions, include, cards, lookup))
 
@@ -386,10 +398,242 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
     return found
 
 
+# --- fuzzy pass --------------------------------------------------------------
+
+FUZZY_MIN_CHARS = 8
+"""Shortest eligible card name, normalized and space-stripped. Shorter names
+("Opt", "Hope", "Delay") are left to the exact pass: at that length one wrong
+letter is a different word."""
+FUZZY_MAX_WORDS = 4
+_ANNOTATION_RE = re.compile(r"\[[^\[\]]{1,40}\]")
+_BREAK_RE = re.compile(r">>|[.?!]")
+
+
+class FuzzyNames:
+    """The card names the fuzzy pass may land on, space-stripped, grouped by length.
+
+    Every normalized card name and face name of at least ``FUZZY_MIN_CHARS``
+    characters once spaces are removed, except the joined full name of a
+    multi-face card ("fire ice"): people say one face. Built once per
+    :func:`scan`, for one threshold, and remembers every query it has answered:
+    a transcript says "the island" and "i think" hundreds of times.
+    """
+
+    def __init__(self, lookup: Lookup, threshold: float) -> None:
+        self.threshold = threshold
+        by_length: dict[int, list[tuple[str, Card]]] = {}
+        seen: set[str] = set()
+        for key, card in lookup.by_name.items():
+            if len(card.faces) > 1 and key == normalize(card.name):
+                continue
+            stripped = key.replace(" ", "")
+            if len(stripped) < FUZZY_MIN_CHARS or stripped in seen:
+                continue
+            seen.add(stripped)
+            by_length.setdefault(len(stripped), []).append((stripped, card))
+        self._by_length = by_length
+        self._choices: dict[int, tuple[list[str], list[Card]]] = {}
+        self._answers: dict[str, tuple[str, Card, float] | None] = {}
+
+    def best(self, query: str) -> tuple[str, Card, float] | None:
+        """``(stripped name, card, score)`` of the closest name scoring at least
+        the threshold with ``fuzz.ratio``, or None."""
+        if query in self._answers:
+            return self._answers[query]
+        answer = None
+        names, cards = self._candidates(len(query))
+        if names:
+            hit = process.extractOne(
+                query, names, scorer=fuzz.ratio, score_cutoff=self.threshold
+            )
+            if hit is not None:
+                name, score, i = hit
+                answer = (name, cards[i], score)
+        self._answers[query] = answer
+        return answer
+
+    def _candidates(self, length: int) -> tuple[list[str], list[Card]]:
+        # fuzz.ratio is 100 * (1 - indel / (len1 + len2)), and the indel distance
+        # is at least the length difference, so names whose length is too far
+        # from the query's can never reach the threshold. Skipping them is most
+        # of what keeps a full transcript fast.
+        if length not in self._choices:
+            slack = 1 - self.threshold / 100
+            names: list[str] = []
+            cards: list[Card] = []
+            for size, entries in self._by_length.items():
+                if abs(size - length) <= slack * (size + length) + 1e-9:
+                    names.extend(name for name, _ in entries)
+                    cards.extend(card for _, card in entries)
+            self._choices[length] = (names, cards)
+        return self._choices[length]
+
+
+def _word_stream(
+    run: list[transcript.Segment],
+) -> tuple[str, list[tuple[str, int, int]], list[str | None]]:
+    """The run's text joined by spaces, its normalized words with character
+    spans in that text, and the start time of the segment each word came from.
+    Built the same way as in :func:`_exact_pass`."""
+    text = " ".join(segment.text for segment in run)
+    words: list[tuple[str, int, int]] = []
+    starts: list[str | None] = []
+    offset = 0
+    for segment in run:
+        for word, lo, hi in _words(segment.text):
+            words.append((word, lo + offset, hi + offset))
+            starts.append(segment.start)
+        offset += len(segment.text) + 1
+    return text, words, starts
+
+
+def _locate(tokens: list[str], key: list[str], cursor: int) -> int | None:
+    """First index at or after ``cursor`` where ``key`` occurs in ``tokens``."""
+    n = len(key)
+    for i in range(cursor, len(tokens) - n + 1):
+        if tokens[i : i + n] == key:
+            return i
+    return None
+
+
+def _fuzzy_pass(
+    run: list[transcript.Segment],
+    found: list[Mention],
+    names: FuzzyNames,
+    common_words: Collection[str],
+) -> list[Mention]:
+    """Add fuzzy mentions to the exact mentions ``found`` in ``run``; return
+    all of them in order of appearance.
+
+    Windows of one to four consecutive words are joined without spaces
+    ("thought seize" -> "thoughtseize") and scored with ``fuzz.ratio``
+    against every eligible name (:class:`FuzzyNames`). ``fuzz.ratio`` and not
+    rapidfuzz's default ``WRatio``: WRatio rewards a window that is merely a
+    substring of a name ("spell" in every "Spell ..." card), while ``ratio``
+    is plain edit similarity that also punishes a length mismatch, which is
+    what a mishearing of the whole name looks like.
+
+    The rules, in order:
+
+    1. A window never includes a captioner's annotation in square brackets
+       ("[laughter]" is not Slaughter) and never spans a speaker change
+       (``>>``) or the end of a sentence (``.``, ``?``, ``!``).
+    2. A one-word window that is itself a common English word is never
+       fuzzed: the captioner heard a real word ("information" is not
+       Formation). Several common words together still are ("bitter blossom").
+    3. A window may not include words of an exact match, with one exception:
+       it may cover exactly one whole exact match plus at least one word next
+       to it, when the exact match is a piece of the longer name it scores
+       against (the match's space-stripped words occur inside that name). That
+       longer fuzzy mention then replaces the exact one. This is how
+       "spell stutter sprite" becomes Spellstutter Sprite although the exact
+       pass already took "spell stutter" as the card Spell Stutter, and
+       "omen speaker" becomes Omenspeaker rather than Omen.
+    4. A window keeps its best name if that scores at least the threshold.
+    5. Overlapping windows are settled best score first; at equal score the
+       longer window wins, then the earlier one. So "bitter blossom" (100)
+       beats "bitter blossom to" (93), and a window that only reaches the
+       threshold by borrowing a neighbour's letters loses to a cleaner one.
+
+    Exact mentions are found again in the word stream by their words, in
+    order: the exact pass consumes left to right, so the first occurrence of a
+    match's words at or after the previous match is where it was taken.
+    """
+    text, words, starts = _word_stream(run)
+    tokens = [w for w, _, _ in words]
+
+    # Where each exact mention sits: owner[i] is the index in `found` of the
+    # mention that consumed word i.
+    owner: list[int | None] = [None] * len(tokens)
+    position: list[int] = []
+    span: list[tuple[int, int] | None] = []
+    cursor = 0
+    for k, mention in enumerate(found):
+        key = [w for w, _, _ in _words(mention.matched_text)]
+        at = _locate(tokens, key, cursor) if key else None
+        if at is None:
+            position.append(cursor)
+            span.append(None)
+            continue
+        for i in range(at, at + len(key)):
+            owner[i] = k
+        position.append(at)
+        span.append((at, at + len(key)))
+        cursor = at + len(key)
+
+    # Words inside [brackets] are annotations, not speech; breaks[k] is True
+    # when no window may span the gap between word k and word k + 1.
+    annotations = [m.span() for m in _ANNOTATION_RE.finditer(text)]
+    noise: list[bool] = []
+    a = 0
+    for _, lo, _ in words:
+        while a < len(annotations) and annotations[a][1] <= lo:
+            a += 1
+        noise.append(a < len(annotations) and annotations[a][0] <= lo)
+    breaks = [
+        bool(_BREAK_RE.search(text, words[k][2], words[k + 1][1]))
+        for k in range(len(words) - 1)
+    ]
+
+    candidates: list[tuple[float, int, int, Card]] = []  # (score, start, end, card)
+    for i in range(len(tokens)):
+        for j in range(i + 1, min(i + FUZZY_MAX_WORDS, len(tokens)) + 1):
+            if noise[j - 1] or (j - 1 > i and breaks[j - 2]):
+                break
+            if j == i + 1 and tokens[i] in common_words:
+                continue
+            inside = {owner[x] for x in range(i, j) if owner[x] is not None}
+            if len(inside) > 1:
+                break
+            exact = span[inside.pop()] if inside else None
+            if exact is not None:
+                lo, hi = exact
+                if lo < i:
+                    break  # starts inside an exact match
+                if hi > j or (lo, hi) == (i, j):
+                    continue  # ends inside it, or is exactly it
+            hit = names.best("".join(tokens[i:j]))
+            if hit is None:
+                continue
+            name, card, score = hit
+            if exact is not None:
+                piece = "".join(tokens[exact[0] : exact[1]])
+                if piece not in name or len(piece) == len(name):
+                    continue
+            candidates.append((score, i, j, card))
+
+    candidates.sort(key=lambda c: (-c[0], -(c[2] - c[1]), c[1]))
+    taken = [False] * len(tokens)
+    fuzzy: list[tuple[int, Mention]] = []
+    absorbed: set[int] = set()
+    for score, i, j, card in candidates:
+        if any(taken[i:j]):
+            continue
+        for x in range(i, j):
+            taken[x] = True
+            if owner[x] is not None:
+                absorbed.add(owner[x])
+        lo = words[max(0, i - CONTEXT_WORDS)][1]
+        hi = words[min(len(words), j + CONTEXT_WORDS) - 1][2]
+        mention = Mention(
+            card=card,
+            matched_text=text[words[i][1] : words[j - 1][2]],
+            timestamp=starts[i],
+            confidence=FUZZY,
+            flagged=False,
+            context=" ".join(text[lo:hi].split()),
+            score=score,
+        )
+        fuzzy.append((i, mention))
+
+    kept = [(position[k], m) for k, m in enumerate(found) if k not in absorbed]
+    return [m for _, m in sorted(kept + fuzzy, key=lambda pair: pair[0])]
+
+
 # --- confidence --------------------------------------------------------------
 
 # Confidence levels a mention can carry. The exact pass produces "exact" and
-# "nickname"; the fuzzy pass (#6) and decklists (#7) set the others, and
+# "nickname", the fuzzy pass "fuzzy"; decklists (#7) set the last one, and
 # is_doubtful already knows what each one means.
 EXACT, DECKLIST, NICKNAME, FUZZY = "exact", "decklist", "nickname", "fuzzy"
 ALWAYS_CONFIDENT = frozenset({DECKLIST, NICKNAME})

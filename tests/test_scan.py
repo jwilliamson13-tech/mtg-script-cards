@@ -467,3 +467,98 @@ def test_default_is_the_bundled_nickname_file():
 def test_bundled_nickname_file_names_only_real_cards():
     cards = load_cards(Path(__file__).resolve().parent.parent / "data" / "cards.json")
     assert nickname_warnings(load_nicknames(), cards) == []
+
+
+# --- fuzzy pass (#6) ---------------------------------------------------------
+
+FUZZY_CARDS = {
+    **CARDS,
+    **index_of(
+        "Cloudfin Raptor",
+        "Secluded Glen",
+        "Spell Stutter",
+        "Spellstutter Sprite",
+        "Omen",
+        "Omenspeaker",
+        "Hope",
+        "Give // Take",
+        "Formation",
+        "Slaughter",
+        "Cryptic Coat",
+    ),
+}
+
+
+def test_misheard_name_from_fixture_is_a_flagged_fuzzy_match():
+    # Verbatim from the fixture transcript: "Cloudfin Raptor" as the captioner heard it.
+    result = scan("Uh, it was it was a cloud finaptor to go\nwith the Biden and the island. Um, I", FUZZY_CARDS)
+    [raptor] = [m for m in result.mentions if m.card.name == "Cloudfin Raptor"]
+    assert raptor.confidence == "fuzzy"
+    assert raptor.flagged is True
+    assert raptor.matched_text == "cloud finaptor"
+    assert raptor in result.flagged()
+    assert result.ordered_cards() == [FUZZY_CARDS["Island"]]
+
+
+def test_another_misheard_name_from_fixture():
+    result = scan(">> I'll just play secluded Glenn. Pass.", FUZZY_CARDS)
+    assert [(m.card.name, m.confidence, m.flagged) for m in result.mentions] == [
+        ("Secluded Glen", "fuzzy", True)
+    ]
+
+
+def test_fuzzy_match_carries_a_numeric_score():
+    result = scan("a cloud finaptor to go", FUZZY_CARDS)
+    [mention] = result.mentions
+    assert isinstance(mention.score, float)
+    assert 86 <= mention.score < 100
+
+
+def test_fuzzy_threshold_is_a_knob():
+    # "cloud finaptor" scores about 96 against Cloudfin Raptor.
+    assert scan("a cloud finaptor to go", FUZZY_CARDS, fuzzy_threshold=97).mentions == []
+
+
+def test_space_split_name_beats_a_shorter_real_card():
+    # Verbatim from the fixture transcript. "spell stutter" alone is the card
+    # Spell Stutter, but the speaker said Spellstutter Sprite.
+    result = scan("single counter spell, spell spell\nstutter sprite, blah blah blah. It's", FUZZY_CARDS)
+    assert [(m.card.name, m.confidence, m.matched_text) for m in result.mentions] == [
+        ("Spellstutter Sprite", "fuzzy", "spell stutter sprite")
+    ]
+
+
+def test_single_word_card_inside_a_longer_name_gives_way():
+    # Verbatim from the fixture transcript: Omen is a card, Omenspeaker was meant.
+    result = scan("We got Omen Speaker. We got whatever", FUZZY_CARDS)
+    assert [(m.card.name, m.confidence) for m in result.mentions] == [("Omenspeaker", "fuzzy")]
+
+
+def test_short_common_words_do_not_fuzz_into_cards():
+    result = scan("I hope you take the information", FUZZY_CARDS)
+    assert [(m.card.name, m.confidence) for m in result.mentions] == [
+        ("Hope", "exact"),
+        ("Give // Take", "exact"),
+    ]
+
+
+def test_captioner_annotations_are_not_speech():
+    result = scan(">> Let me play the swamp. [laughter] One,", FUZZY_CARDS)
+    assert result.mentions == []
+
+
+def test_exact_matches_are_unaffected_by_the_fuzzy_pass():
+    result = scan("even cryptic command for disruption, then thoughtseize", FUZZY_CARDS)
+    assert [(m.card.name, m.confidence, m.flagged, m.score) for m in result.mentions] == [
+        ("Cryptic Command", "exact", False, None),
+        ("Thoughtseize", "exact", False, None),
+    ]
+
+
+def test_fuzzy_match_in_vtt_carries_the_cue_timestamp():
+    cards = {**CAPTION_CARDS, **index_of("Bitterblossom")}
+    result = scan(CRYPTIC_VTT, cards)
+    assert [(m.card.name, m.confidence, m.timestamp) for m in result.mentions] == [
+        ("Bitterblossom", "fuzzy", "00:00:35.760"),
+        ("Cryptic Command", "exact", "00:00:37.360"),
+    ]

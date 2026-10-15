@@ -215,12 +215,17 @@ def print_review(result: matcher.ScanResult, argv: list[str]) -> None:
     print()
     print(
         f"Held back for review, not downloaded: {len(first)} cards "
-        f"({len(result.flagged())} mentions) whose name is also an ordinary word."
+        f"({len(result.flagged())} mentions). Either the name is also an ordinary word, "
+        f"or the words only sound like it (fuzzy, with a 0-100 similarity score)."
     )
     for name, m in first.items():
         more = counts[name] - 1
         tail = f"  (+{more} more)" if more else ""
-        print(f'  {name:<{width}}  "{m.matched_text}"  {m.timestamp or "-"}  ...{m.context}...{tail}')
+        how = f"  fuzzy {m.score:.0f}" if m.confidence == matcher.FUZZY and m.score is not None else ""
+        print(
+            f'  {name:<{width}}  "{m.matched_text}"{how}  {m.timestamp or "-"}  '
+            f"...{m.context}...{tail}"
+        )
     print()
     print("To download them, run this, after deleting the --include for any card you do not want:")
     print(rerun_command(argv, list(first)))
