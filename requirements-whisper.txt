@@ -3,3 +3,6 @@
 # Install requirements.txt first. faster-whisper brings its own audio decoder,
 # so ffmpeg does not need to be installed.
 faster-whisper>=1.2.1
+# PyAV 19 dropped an argument faster-whisper 1.2.1 passes when it opens a file
+# (TypeError: open() got an unexpected keyword argument 'metadata_errors').
+av<19
