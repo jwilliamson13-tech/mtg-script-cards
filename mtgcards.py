@@ -279,9 +279,12 @@ def print_review(result: matcher.ScanResult, argv: list[str]) -> None:
 # --- run -----------------------------------------------------------------------
 
 
-def load_nicknames(path: str | None, cards: matcher.CardIndex) -> dict[str, str] | None:
+def load_nicknames_or_exit(
+    path: str | None, cards: matcher.CardIndex
+) -> dict[str, str] | None:
     """The nickname file (``--nicknames`` or the bundled one), with a warning on
-    stderr for each entry that will be skipped. None if the file is unreadable."""
+    stderr for each entry that will be skipped. None, after a message on
+    stderr, if the file is unreadable or not valid: the run then exits 2."""
     shown = Path(path) if path else matcher.NICKNAMES_PATH
     try:
         nicknames = matcher.load_nicknames(path)
@@ -378,7 +381,7 @@ def run(
     """Scan ``transcript_path`` and fill ``out_dir``. With ``audio_args``, the
     transcript is first made from ``audio_args.audio`` if it does not exist."""
     cards = matcher.load_cards(CARDS_PATH)
-    nicknames = load_nicknames(nicknames_path, cards)
+    nicknames = load_nicknames_or_exit(nicknames_path, cards)
     if nicknames is None:
         return 2
     lookup = matcher.build_lookup(cards)
