@@ -497,10 +497,42 @@ def _runs(segments: list[transcript.Segment]) -> list[list[transcript.Segment]]:
     return runs
 
 
-def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
-    # One word stream over the whole run, each word remembering the segment it
-    # came from, so a match can cross a cue break and still take the timestamp
-    # of the cue it starts in.
+@dataclass(frozen=True, slots=True)
+class _WordStream:
+    """A run's text joined by spaces, its normalized words with character
+    spans in that text, and the start time of the segment each word came from.
+
+    One stream over the whole run, so a match can cross a cue break and still
+    take the timestamp of the cue it starts in."""
+
+    text: str
+    words: list[tuple[str, int, int]]
+    starts: list[str | None]
+
+    @property
+    def tokens(self) -> list[str]:
+        return [w for w, _, _ in self.words]
+
+    def mention(
+        self, i: int, j: int, card: Card, confidence: str, score: float | None = None
+    ) -> Mention:
+        """An unflagged mention of ``card`` for words ``i`` to ``j`` (exclusive),
+        with ``CONTEXT_WORDS`` words either side as context."""
+        words, text = self.words, self.text
+        lo = words[max(0, i - CONTEXT_WORDS)][1]
+        hi = words[min(len(words), j + CONTEXT_WORDS) - 1][2]
+        return Mention(
+            card=card,
+            matched_text=text[words[i][1] : words[j - 1][2]],
+            timestamp=self.starts[i],
+            confidence=confidence,
+            flagged=False,
+            context=" ".join(text[lo:hi].split()),
+            score=score,
+        )
+
+
+def _word_stream(run: list[transcript.Segment]) -> _WordStream:
     text = " ".join(segment.text for segment in run)
     words: list[tuple[str, int, int]] = []
     starts: list[str | None] = []
@@ -510,7 +542,12 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
             words.append((word, lo + offset, hi + offset))
             starts.append(segment.start)
         offset += len(segment.text) + 1
-    tokens = [w for w, _, _ in words]
+    return _WordStream(text, words, starts)
+
+
+def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
+    stream = _word_stream(run)
+    tokens = stream.tokens
     found: list[Mention] = []
     i = 0
     while i < len(tokens):
@@ -524,19 +561,7 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
             if card is None:
                 card, confidence = lookup.by_name.get(key), EXACT
             if card is not None:
-                start, end = words[i][1], words[i + n - 1][2]
-                lo = words[max(0, i - CONTEXT_WORDS)][1]
-                hi = words[min(len(words), i + n + CONTEXT_WORDS) - 1][2]
-                found.append(
-                    Mention(
-                        card=card,
-                        matched_text=text[start:end],
-                        timestamp=starts[i],
-                        confidence=confidence,
-                        flagged=False,
-                        context=" ".join(text[lo:hi].split()),
-                    )
-                )
+                found.append(stream.mention(i, i + n, card, confidence))
                 i += n
                 break
         else:
@@ -639,24 +664,6 @@ class FuzzyNames:
         return self._choices[length]
 
 
-def _word_stream(
-    run: list[transcript.Segment],
-) -> tuple[str, list[tuple[str, int, int]], list[str | None]]:
-    """The run's text joined by spaces, its normalized words with character
-    spans in that text, and the start time of the segment each word came from.
-    Built the same way as in :func:`_exact_pass`."""
-    text = " ".join(segment.text for segment in run)
-    words: list[tuple[str, int, int]] = []
-    starts: list[str | None] = []
-    offset = 0
-    for segment in run:
-        for word, lo, hi in _words(segment.text):
-            words.append((word, lo + offset, hi + offset))
-            starts.append(segment.start)
-        offset += len(segment.text) + 1
-    return text, words, starts
-
-
 def _locate(tokens: list[str], key: list[str], cursor: int) -> int | None:
     """First index at or after ``cursor`` where ``key`` occurs in ``tokens``."""
     n = len(key)
@@ -718,8 +725,8 @@ def _fuzzy_pass(
     order: the exact pass consumes left to right, so the first occurrence of a
     match's words at or after the previous match is where it was taken.
     """
-    text, words, starts = _word_stream(run)
-    tokens = [w for w, _, _ in words]
+    stream = _word_stream(run)
+    text, words, tokens = stream.text, stream.words, stream.tokens
 
     # Where each exact mention sits: owner[i] is the index in `found` of the
     # mention that consumed word i.
@@ -810,18 +817,7 @@ def _fuzzy_pass(
             taken[x] = True
             if owner[x] is not None:
                 absorbed.add(owner[x])
-        lo = words[max(0, i - CONTEXT_WORDS)][1]
-        hi = words[min(len(words), j + CONTEXT_WORDS) - 1][2]
-        mention = Mention(
-            card=card,
-            matched_text=text[words[i][1] : words[j - 1][2]],
-            timestamp=starts[i],
-            confidence=confidence,
-            flagged=False,
-            context=" ".join(text[lo:hi].split()),
-            score=score,
-        )
-        fuzzy.append((i, mention))
+        fuzzy.append((i, stream.mention(i, j, card, confidence, score)))
 
     kept = [(position[k], m) for k, m in enumerate(found) if k not in absorbed]
     return [m for _, m in sorted(kept + fuzzy, key=lambda pair: pair[0])]
