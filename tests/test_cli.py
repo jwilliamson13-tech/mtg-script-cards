@@ -60,3 +60,17 @@ def test_any_transcriber_error_is_one_line_not_a_traceback(tmp_path, monkeypatch
     assert capsys.readouterr().err.strip() == (
         f"Could not transcribe {audio}: expected str, got NoneType"
     )
+
+
+def test_rerun_command_drops_double_quotes_from_a_name_and_still_finds_the_card(monkeypatch):
+    monkeypatch.setattr(mtgcards.sys, "argv", ["mtgcards.py"])
+    kongming = card('Kongming, "Sleeping Dragon"')
+    command = mtgcards.rerun_command(["talk.srt"], [kongming.name, "Hope"])
+    assert command == (
+        'python mtgcards.py talk.srt --include "Kongming, Sleeping Dragon" --include "Hope"'
+    )
+    lookup = matcher.build_lookup({kongming.name: kongming})
+    assert mtgcards.split_include_values(["Kongming, Sleeping Dragon"], lookup) == [
+        "Kongming, Sleeping Dragon"
+    ]
+    assert lookup.by_name[matcher.normalize("Kongming, Sleeping Dragon")] is kongming

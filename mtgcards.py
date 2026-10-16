@@ -228,10 +228,15 @@ _PLAIN_ARG = re.compile(r"[\w./:\\=+-]+")
 
 
 def _quote(arg: str, always: bool = False) -> str:
-    """Quote an argument so it pastes into PowerShell, cmd or a POSIX shell."""
+    """Quote an argument so it pastes into PowerShell, cmd or a POSIX shell.
+
+    Double quotes inside it are dropped, not escaped: PowerShell 5.1 rejects
+    ``\\"``, and ``--include`` ignores punctuation, so
+    ``Kongming, "Sleeping Dragon"`` still finds the card without them.
+    """
     if not always and _PLAIN_ARG.fullmatch(arg):
         return arg
-    return '"' + arg.replace('"', '\\"') + '"'
+    return '"' + arg.replace('"', "") + '"'
 
 
 def rerun_command(argv: list[str], names: list[str]) -> str:
