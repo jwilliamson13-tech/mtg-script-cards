@@ -406,7 +406,12 @@ def run(
             included.append((name, card))
 
     result = matcher.scan(
-        text, cards, nicknames=nicknames, include=included, decklists=decklists
+        text,
+        cards,
+        nicknames=nicknames,
+        include=included,
+        decklists=decklists,
+        common_words=matcher.bundled_common_words(),
     )
     ordered = result.ordered_cards()
     numbers = {card.name: i for i, card in enumerate(ordered, start=1)}

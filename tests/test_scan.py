@@ -1,8 +1,25 @@
 """Behaviour of the ``scan`` seam: which cards come out, in what order, how confident."""
 
+import builtins
+import io
 from pathlib import Path
 
-from matcher import Card, load_cards, load_nicknames, nickname_warnings, scan
+import pytest
+
+import matcher
+from matcher import Card, load_cards, load_common_words, load_nicknames, nickname_warnings
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# The bundled word list, read once here: scan itself reads no files.
+COMMON_WORDS = load_common_words(DATA_DIR / "common_words.txt")
+
+
+def scan(text, cards, **knobs):
+    """``matcher.scan`` with the bundled common-word list unless a test passes
+    its own. Nicknames stay off unless a test passes some."""
+    knobs.setdefault("common_words", COMMON_WORDS)
+    return matcher.scan(text, cards, **knobs)
+
 
 FABLE = "Fable of the Mirror-Breaker // Reflection of Kiki-Jiki"
 
@@ -459,14 +476,31 @@ def test_empty_nicknames_switch_them_off():
     assert result.mentions == []
 
 
-def test_default_is_the_bundled_nickname_file():
-    result = scan("then I fetch the trop", NICK_CARDS)
+def test_default_is_no_nicknames():
+    assert scan("then I fetch the trop", NICK_CARDS).mentions == []
+
+
+def test_bundled_nickname_file_has_trop():
+    result = scan("then I fetch the trop", NICK_CARDS, nicknames=matcher.bundled_nicknames())
     assert [(m.card.name, m.confidence) for m in result.mentions] == [("Tropical Island", "nickname")]
 
 
 def test_bundled_nickname_file_names_only_real_cards():
-    cards = load_cards(Path(__file__).resolve().parent.parent / "data" / "cards.json")
+    cards = load_cards(DATA_DIR / "cards.json")
     assert nickname_warnings(load_nicknames(), cards) == []
+
+
+def test_scan_with_default_knobs_reads_no_files(monkeypatch):
+    def no_files(*args, **kwargs):
+        raise AssertionError("scan touched the filesystem")
+
+    monkeypatch.setattr(builtins, "open", no_files)
+    monkeypatch.setattr(io, "open", no_files)
+    monkeypatch.setattr(Path, "open", no_files)
+    monkeypatch.setattr(matcher, "bundled_nicknames", no_files)
+    monkeypatch.setattr(matcher, "bundled_common_words", no_files)
+    result = matcher.scan("I hope I fetch the trop and a tropical island", NICK_CARDS)
+    assert [m.card.name for m in result.mentions] == ["Tropical Island"]
 
 
 # --- fuzzy pass (#6) ---------------------------------------------------------

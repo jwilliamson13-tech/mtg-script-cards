@@ -1,5 +1,7 @@
 """Card matching. Pure: no network, no filesystem beyond the loaders
-(:func:`load_cards`, :func:`load_common_words`, :func:`load_nicknames`).
+(:func:`load_cards`, :func:`load_common_words`, :func:`load_nicknames` and the
+``bundled_*`` helpers), which only the CLI and tests call. :func:`scan` and
+everything it calls work on what they are given.
 
 The seam is :func:`scan`: raw transcript text and an in-memory card index in,
 ordered mentions out. Everything that decides *which card was said* lives here.
@@ -396,8 +398,8 @@ def scan(
     normalized card name or nickname that starts there, consume its words,
     move on. Nickname matches carry ``confidence="nickname"``.
 
-    ``nicknames`` maps nickname to Oracle name; None means the bundled
-    ``data/nicknames.json`` and ``{}`` switches nicknames off. Entries whose
+    ``nicknames`` maps nickname to Oracle name; None or ``{}`` means no
+    nicknames (the CLI passes :func:`bundled_nicknames`). Entries whose
     Oracle name is not in ``cards`` are skipped (:func:`nickname_warnings`
     lists them). When a nickname and a real card name are the same words, the
     nickname wins: someone put it in the nickname file on purpose. A longer
@@ -416,7 +418,8 @@ def scan(
     Every mention then gets its confidence rule applied (:func:`is_doubtful`):
     doubtful ones come back with ``flagged=True`` and are never downloaded.
     ``common_words`` is the normalized word list behind that rule; None means
-    the bundled ``data/common_words.txt``.
+    an empty list (the CLI passes :func:`bundled_common_words`). ``scan``
+    reads no files: the caller loads both lists.
 
     ``include`` lists cards the user has accepted: names present in ``cards``,
     :class:`Card` objects (which need not be in ``cards``, e.g. a joke-set card
@@ -451,8 +454,8 @@ def scan(
       "Jace better" Jace Beleren; at 77 the only wrong hit left is
       "thought I" as Thoughtseize, a card the video does show.
     """
-    lookup = build_lookup(cards, bundled_nicknames() if nicknames is None else nicknames)
-    common = bundled_common_words() if common_words is None else common_words
+    lookup = build_lookup(cards, nicknames)
+    common = frozenset() if common_words is None else common_words
     deck = decklist_cards(decklists, cards, lookup)
     deck_names = None
     if deck:
