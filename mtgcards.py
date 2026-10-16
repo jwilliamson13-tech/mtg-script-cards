@@ -360,7 +360,7 @@ def transcribe_audio(
     except transcribe.TranscriberMissing as exc:
         print(exc, file=sys.stderr)
         return False
-    except (RuntimeError, ValueError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - faster-whisper and its decoders raise many kinds
         reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
         print(f"Could not transcribe {audio}: {reason}", file=sys.stderr)
         return False

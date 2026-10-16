@@ -1,5 +1,6 @@
 """The CLI's output files and printed commands."""
 
+import argparse
 import csv
 
 import matcher
@@ -43,3 +44,19 @@ def test_manifest_has_a_row_per_mention_with_blank_order_when_held(tmp_path):
         ("1", "Thoughtseize", "thoughtseize", "exact"),
         ("", "Thoughtseize", "thought seas", "fuzzy"),
     ]
+
+
+def test_any_transcriber_error_is_one_line_not_a_traceback(tmp_path, monkeypatch, capsys):
+    def broken(*args, **kwargs):
+        raise TypeError("expected str, got NoneType\nmore detail")
+
+    monkeypatch.setattr(mtgcards.transcribe, "transcribe", broken)
+    args = argparse.Namespace(model="small", device="auto", compute_type=None)
+    audio = tmp_path / "episode.mp4"
+    ok = mtgcards.transcribe_audio(
+        audio, tmp_path / "episode.srt", [], {}, matcher.build_lookup({}), args
+    )
+    assert ok is False
+    assert capsys.readouterr().err.strip() == (
+        f"Could not transcribe {audio}: expected str, got NoneType"
+    )
