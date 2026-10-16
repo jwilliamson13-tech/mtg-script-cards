@@ -189,16 +189,14 @@ def split_include_values(values: list[str], lookup: matcher.Lookup) -> list[str]
     return names
 
 
-def resolve_include(
-    name: str, cards: matcher.CardIndex, lookup: matcher.Lookup
-) -> tuple[matcher.Card | None, str]:
+def resolve_include(name: str, lookup: matcher.Lookup) -> tuple[matcher.Card | None, str]:
     """Find the card an ``--include`` name means: ``(card, note)`` or ``(None, why not)``.
 
     The bundled dictionary first (Oracle name, then normalized name or face
     name), then Scryfall's fuzzy lookup, which also reaches cards the
     dictionary leaves out (joke sets).
     """
-    card = cards.get(name) or lookup.by_name.get(matcher.normalize(name))
+    card = lookup.find(name)
     if card is not None:
         return card, ""
     try:
@@ -216,8 +214,8 @@ def resolve_include(
             f'"{name}" only matches the {kind} "{found.get("name")}" on Scryfall, not a card; '
             "try more of the name"
         )
-    if found["name"] in cards:
-        return cards[found["name"]], f'"{name}" is {found["name"]} (Scryfall)'
+    if found["name"] in lookup.cards:
+        return lookup.cards[found["name"]], f'"{name}" is {found["name"]} (Scryfall)'
     card = matcher.Card(**build_dictionary.entry(found))
     return card, f'"{name}" is {card.name} (Scryfall; not in the bundled card list)'
 
@@ -298,9 +296,7 @@ def load_nicknames(path: str | None, cards: matcher.CardIndex) -> dict[str, str]
     return nicknames
 
 
-def load_decklists(
-    paths: list[str], cards: matcher.CardIndex, lookup: matcher.Lookup
-) -> list[list[str]] | None:
+def load_decklists(paths: list[str], lookup: matcher.Lookup) -> list[list[str]] | None:
     """Each ``--decklist`` file's card names, with a warning on stderr for each
     name that is no card (it is ignored). None if a file is unreadable."""
     decklists = []
@@ -311,7 +307,7 @@ def load_decklists(
             print(f"Could not read the decklist {path}: {exc.strerror or exc}", file=sys.stderr)
             return None
         names = decklist.parse_decklist(text)
-        for name in decklist.unknown_names(names, cards, lookup):
+        for name in decklist.unknown_names(names, lookup.cards, lookup):
             print(
                 f'{Path(path).name}: no card named "{name}" in the card list; ignored',
                 file=sys.stderr,
@@ -320,14 +316,12 @@ def load_decklists(
     return decklists
 
 
-def prompt_spellings(
-    names: list[str], cards: matcher.CardIndex, lookup: matcher.Lookup
-) -> list[str]:
+def prompt_spellings(names: list[str], lookup: matcher.Lookup) -> list[str]:
     """A decklist's names as the transcriber should spell them: the Oracle
     name, or each face name of a multi-face card. Unknown names are left out."""
     spellings = []
     for name in names:
-        card = cards.get(name) or lookup.by_name.get(matcher.normalize(name))
+        card = lookup.find(name)
         if card is not None:
             spellings += card.faces if len(card.faces) > 1 else [card.name]
     return spellings
@@ -337,7 +331,6 @@ def transcribe_audio(
     audio: Path,
     srt_path: Path,
     decklists: list[list[str]],
-    cards: matcher.CardIndex,
     lookup: matcher.Lookup,
     args: argparse.Namespace,
 ) -> bool:
@@ -351,7 +344,7 @@ def transcribe_audio(
         )
         return True
     names = transcribe.prompt_names(
-        [prompt_spellings(deck, cards, lookup) for deck in decklists]
+        [prompt_spellings(deck, lookup) for deck in decklists]
     )
     try:
         transcribe.transcribe(
@@ -389,11 +382,11 @@ def run(
     if nicknames is None:
         return 2
     lookup = matcher.build_lookup(cards)
-    decklists = load_decklists(decklist_paths or [], cards, lookup)
+    decklists = load_decklists(decklist_paths or [], lookup)
     if decklists is None:
         return 2
     if audio_args is not None and not transcribe_audio(
-        Path(audio_args.audio), transcript_path, decklists, cards, lookup, audio_args
+        Path(audio_args.audio), transcript_path, decklists, lookup, audio_args
     ):
         return 2
     text = transcript_path.read_text(encoding="utf-8-sig", errors="replace")
@@ -402,7 +395,7 @@ def run(
     unresolved = 0
     if include:
         for name in split_include_values(include, lookup):
-            card, note = resolve_include(name, cards, lookup)
+            card, note = resolve_include(name, lookup)
             if card is None:
                 unresolved += 1
                 print(f"--include: {note}", file=sys.stderr)

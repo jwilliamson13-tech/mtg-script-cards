@@ -155,14 +155,21 @@ def normalize(text: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Lookup:
-    """Normalized name -> card, normalized nickname -> card, the longest key
-    length in words across both, and the decklist table (:func:`decklist_keys`):
-    space-stripped key -> decklist card."""
+    """The card index by Oracle name, normalized name -> card, normalized
+    nickname -> card, the longest key length in words across those two, and
+    the decklist table (:func:`decklist_keys`): space-stripped key -> decklist
+    card."""
 
+    cards: dict[str, Card]
     by_name: dict[str, Card]
     max_words: int
     nicknames: dict[str, Card] = field(default_factory=dict)
     decklist: dict[str, Card] = field(default_factory=dict)
+
+    def find(self, name: str) -> Card | None:
+        """The card ``name`` means: an Oracle name as written, else a card or
+        face name once normalized ("lightning bolt", "Delver of Secrets")."""
+        return self.cards.get(name) or self.by_name.get(normalize(name))
 
 
 def build_lookup(
@@ -188,20 +195,20 @@ def build_lookup(
             key = normalize(face)
             if key:
                 by_name.setdefault(key, card)
-    nicks, _ = _resolve_nicknames(nicknames or {}, values, by_name)
+    lookup = Lookup(cards={card.name: card for card in values}, by_name=by_name, max_words=0)
+    nicks, _ = _resolve_nicknames(nicknames or {}, lookup)
     max_words = max((key.count(" ") + 1 for key in [*by_name, *nicks]), default=0)
-    return Lookup(by_name, max_words, nicks)
+    return dataclasses.replace(lookup, max_words=max_words, nicknames=nicks)
 
 
 def _resolve_nicknames(
-    nicknames: Mapping[str, str], cards: Iterable[Card], by_name: Mapping[str, Card]
+    nicknames: Mapping[str, str], lookup: Lookup
 ) -> tuple[dict[str, Card], list[str]]:
     """Normalized nickname -> card, and one warning per entry left out.
 
-    The Oracle name is looked up as written, then normalized, so "lightning
+    The Oracle name is looked up with :meth:`Lookup.find`, so "lightning
     bolt" or a face name like "Delver of Secrets" also works.
     """
-    named = {card.name: card for card in cards}
     table: dict[str, Card] = {}
     first_spelling: dict[str, str] = {}
     warnings: list[str] = []
@@ -215,7 +222,7 @@ def _resolve_nicknames(
                 f'nickname "{nickname}": expected a card name, found {oracle!r}; skipped'
             )
             continue
-        card = named.get(oracle) or by_name.get(normalize(oracle))
+        card = lookup.find(oracle)
         if card is None:
             warnings.append(
                 f'nickname "{nickname}": no card named "{oracle}" in the card list; skipped'
@@ -240,7 +247,7 @@ def nickname_warnings(nicknames: Mapping[str, str], cards: CardIndex) -> list[st
     nickname has no letters or digits, or when it repeats an earlier nickname
     (after normalizing) for a different card.
     """
-    return _resolve_nicknames(nicknames, cards.values(), build_lookup(cards).by_name)[1]
+    return _resolve_nicknames(nicknames, build_lookup(cards))[1]
 
 
 # --- decklists -------------------------------------------------------------
@@ -266,18 +273,18 @@ def _as_decklists(decklists: Iterable[Iterable[str]] | Iterable[str]) -> list[li
 
 
 def decklist_cards(
-    decklists: Iterable[Iterable[str]] | Iterable[str], cards: Mapping[str, Card], lookup: Lookup
+    decklists: Iterable[Iterable[str]] | Iterable[str], lookup: Lookup
 ) -> dict[str, Card]:
     """Every card named in ``decklists``, keyed by Oracle name, in list order.
 
-    A name is looked up as written, then normalized, so a face name or
+    Names are looked up with :meth:`Lookup.find`, so a face name or
     lowercase works. Names that are no card are skipped here; the CLI warns
     about them (``decklist.unknown_names``).
     """
     deck: dict[str, Card] = {}
     for names in _as_decklists(decklists):
         for name in names:
-            card = cards.get(name) or lookup.by_name.get(normalize(name))
+            card = lookup.find(name)
             if card is not None:
                 deck.setdefault(card.name, card)
     return deck
@@ -456,7 +463,7 @@ def scan(
     """
     lookup = build_lookup(cards, nicknames)
     common = frozenset() if common_words is None else common_words
-    deck = decklist_cards(decklists, cards, lookup)
+    deck = decklist_cards(decklists, lookup)
     deck_names = None
     if deck:
         lookup = dataclasses.replace(
@@ -477,7 +484,7 @@ def scan(
         for m in mentions
     ]
     mentions = [_with_confidence_rule(m, common) for m in mentions]
-    return ScanResult(_apply_includes(mentions, include, cards, lookup))
+    return ScanResult(_apply_includes(mentions, include, lookup))
 
 
 def _runs(segments: list[transcript.Segment]) -> list[list[transcript.Segment]]:
@@ -863,16 +870,14 @@ def _with_confidence_rule(mention: Mention, common_words: Collection[str]) -> Me
     return dataclasses.replace(mention, flagged=flagged)
 
 
-def _resolve_include(
-    item: Card | str | tuple[str, Card], cards: Mapping[str, Card], lookup: Lookup
-) -> tuple[Card, str]:
+def _resolve_include(item: Card | str | tuple[str, Card], lookup: Lookup) -> tuple[Card, str]:
     """``(card, matched_text)`` for one include entry."""
     if isinstance(item, Card):
         return item, item.name
     if isinstance(item, tuple):
         text, card = item
         return card, text
-    card = cards.get(item) or lookup.by_name.get(normalize(item))
+    card = lookup.find(item)
     if card is None:
         raise KeyError(f"included card not in the card index: {item!r}")
     return card, item
@@ -881,12 +886,11 @@ def _resolve_include(
 def _apply_includes(
     mentions: list[Mention],
     include: Sequence[Card | str | tuple[str, Card]],
-    cards: Mapping[str, Card],
     lookup: Lookup,
 ) -> list[Mention]:
     if isinstance(include, (str, Card)):
         include = [include]
-    resolved = [_resolve_include(item, cards, lookup) for item in include]
+    resolved = [_resolve_include(item, lookup) for item in include]
     if not resolved:
         return mentions
     included = {card.name for card, _ in resolved}

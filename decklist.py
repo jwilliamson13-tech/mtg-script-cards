@@ -49,5 +49,5 @@ def unknown_names(
     """The names in ``names`` that are no card in ``cards``: neither an Oracle
     name as written nor, once normalized, a card or face name. ``scan`` skips
     these; the CLI warns about them."""
-    by_name = (lookup or matcher.build_lookup(cards)).by_name
-    return [name for name in names if name not in cards and matcher.normalize(name) not in by_name]
+    lookup = lookup or matcher.build_lookup(cards)
+    return [name for name in names if lookup.find(name) is None]

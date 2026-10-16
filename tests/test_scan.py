@@ -4,8 +4,6 @@ import builtins
 import io
 from pathlib import Path
 
-import pytest
-
 import matcher
 from matcher import Card, load_cards, load_common_words, load_nicknames, nickname_warnings
 
