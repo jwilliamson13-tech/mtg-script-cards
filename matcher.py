@@ -20,6 +20,7 @@ import unicodedata
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from rapidfuzz import fuzz, process
 
@@ -591,6 +592,14 @@ _ANNOTATION_RE = re.compile(r"\[[^\[\]]{1,40}\]")
 _BREAK_RE = re.compile(r">>|[.?!]")
 
 
+class FuzzyHit(NamedTuple):
+    """The closest eligible name to a fuzzy query (:meth:`FuzzyNames.best`)."""
+
+    name: str  # normalized and space-stripped
+    card: Card
+    score: float
+
+
 class FuzzyNames:
     """The card names the fuzzy pass may land on, space-stripped, grouped by length.
 
@@ -635,11 +644,11 @@ class FuzzyNames:
             by_length.setdefault(len(stripped), []).append((stripped, card))
         self._by_length = by_length
         self._choices: dict[int, tuple[list[str], list[Card]]] = {}
-        self._answers: dict[str, tuple[str, Card, float] | None] = {}
+        self._answers: dict[str, FuzzyHit | None] = {}
 
-    def best(self, query: str) -> tuple[str, Card, float] | None:
-        """``(stripped name, card, score)`` of the closest name scoring at least
-        the threshold with ``fuzz.ratio``, or None."""
+    def best(self, query: str) -> FuzzyHit | None:
+        """The closest name scoring at least the threshold with ``fuzz.ratio``,
+        or None."""
         if query in self._answers:
             return self._answers[query]
         answer = None
@@ -650,7 +659,7 @@ class FuzzyNames:
             )
             if hit is not None:
                 name, score, i = hit
-                answer = (name, cards[i], score)
+                answer = FuzzyHit(name, cards[i], score)
         self._answers[query] = answer
         return answer
 
@@ -669,6 +678,24 @@ class FuzzyNames:
                     cards.extend(card for _, card in entries)
             self._choices[length] = (names, cards)
         return self._choices[length]
+
+
+class _Candidate(NamedTuple):
+    """A fuzzy window, words ``start`` to ``end`` (exclusive), and its hit."""
+
+    score: float
+    start: int
+    end: int
+    card: Card
+    confidence: str
+
+
+class _Placed(NamedTuple):
+    """A mention and the index of the word it starts at, for putting the exact
+    and fuzzy mentions of a run back in order."""
+
+    at: int
+    mention: Mention
 
 
 def _locate(tokens: list[str], key: list[str], cursor: int) -> int | None:
@@ -771,8 +798,7 @@ def _fuzzy_pass(
     protected = [
         m.confidence in (NICKNAME, DECKLIST) or m.card.name in deck for m in found
     ]
-    # (score, start, end, card, confidence)
-    candidates: list[tuple[float, int, int, Card, str]] = []
+    candidates: list[_Candidate] = []
     for i in range(len(tokens)):
         for j in range(i + 1, min(i + FUZZY_MAX_WORDS, len(tokens)) + 1):
             if noise[j - 1] or (j - 1 > i and breaks[j - 2]):
@@ -798,24 +824,24 @@ def _fuzzy_pass(
                 deck_hit = deck_names.best(query)
                 if (
                     deck_hit is not None
-                    and len(deck_hit[0]) < FUZZY_MIN_CHARS
+                    and len(deck_hit.name) < FUZZY_MIN_CHARS
                     and (j > i + 1 or not query.isalpha())
                 ):
                     deck_hit = None
-                if deck_hit is not None and (hit is None or deck_hit[2] >= hit[2]):
+                if deck_hit is not None and (hit is None or deck_hit.score >= hit.score):
                     hit, confidence = deck_hit, DECKLIST
             if hit is None:
                 continue
-            name, card, score = hit
             if exact is not None:
                 piece = "".join(tokens[exact[0] : exact[1]])
-                if piece not in name or len(piece) == len(name):
+                if piece not in hit.name or len(piece) == len(hit.name):
                     continue
-            candidates.append((score, i, j, card, confidence))
+            candidates.append(_Candidate(hit.score, i, j, hit.card, confidence))
 
-    candidates.sort(key=lambda c: (-c[0], -(c[2] - c[1]), c[1]))
+    # Best score first; at equal score the longer window, then the earlier one.
+    candidates.sort(key=lambda c: (-c.score, -(c.end - c.start), c.start))
     taken = [False] * len(tokens)
-    fuzzy: list[tuple[int, Mention]] = []
+    fuzzy: list[_Placed] = []
     absorbed: set[int] = set()
     for score, i, j, card, confidence in candidates:
         if any(taken[i:j]):
@@ -824,10 +850,10 @@ def _fuzzy_pass(
             taken[x] = True
             if owner[x] is not None:
                 absorbed.add(owner[x])
-        fuzzy.append((i, stream.mention(i, j, card, confidence, score)))
+        fuzzy.append(_Placed(i, stream.mention(i, j, card, confidence, score)))
 
-    kept = [(position[k], m) for k, m in enumerate(found) if k not in absorbed]
-    return [m for _, m in sorted(kept + fuzzy, key=lambda pair: pair[0])]
+    kept = [_Placed(position[k], m) for k, m in enumerate(found) if k not in absorbed]
+    return [p.mention for p in sorted(kept + fuzzy, key=lambda p: p.at)]
 
 
 # --- confidence --------------------------------------------------------------
