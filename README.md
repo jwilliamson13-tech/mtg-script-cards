@@ -50,9 +50,9 @@ Inside the folder:
 
 - One PNG per card, numbered by when the card is first mentioned: `001-thoughtseize.png`, `002-bitterblossom.png` and so on. A card mentioned ten times still gets one image.
 - Double-faced cards get two images with the same number: `004-delver-of-secrets-insectile-aberration-front.png` and `...-back.png`.
-- `manifest.csv`, which opens in Excel. It has one row per mention of a downloaded card, with the columns `order` (the number in the file name), `card`, `timestamp`, `matched_text` (the words in the transcript that matched), `confidence` (how it matched: `exact`, `decklist`, `nickname` or `fuzzy`) and `scryfall_url` (the card's page on Scryfall, where you can pick a different printing).
+- `manifest.csv`, which opens in Excel. It has one row per mention, in the order they come up, with the columns `order` (the number in the file name), `card`, `timestamp`, `matched_text` (the words in the transcript that matched), `confidence` (how it matched: `exact`, `decklist`, `nickname` or `fuzzy`) and `scryfall_url` (the card's page on Scryfall, where you can pick a different printing).
 
-Cards held for review (next section) are not in `manifest.csv`. The images are Scryfall's default printing, with transparent rounded corners. Running the same command again skips images that are already there.
+Mentions held for review (next section) are in `manifest.csv` too, with an empty `order`, because they have no image. The images are Scryfall's default printing, with transparent rounded corners. Running the same command again skips images that are already there.
 
 ## The review step
 

@@ -142,14 +142,14 @@ def earlier_images(out_dir: Path) -> dict[str, Path]:
 
 
 def write_manifest(path: Path, result: matcher.ScanResult, numbers: dict[str, int]) -> None:
-    """One row per confident mention. Flagged mentions are left out: the
-    manifest describes the folder, and the review printout covers the rest."""
+    """One row per mention, in order of appearance. A mention held for review
+    has no image yet, so its ``order`` is blank."""
     # utf-8-sig so Excel shows accented card names correctly.
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.writer(fh)
         writer.writerow(MANIFEST_COLUMNS)
-        for m in result.confident():
-            order = numbers.get(m.card.name)
+        for m in result.mentions:
+            order = None if m.flagged else numbers.get(m.card.name)
             writer.writerow(
                 [
                     "" if order is None else order,
@@ -257,7 +257,8 @@ def print_review(result: matcher.ScanResult, argv: list[str]) -> None:
     print(
         f"Held back for review, not downloaded: {len(first)} cards "
         f"({len(result.flagged())} mentions). Either the name is also an ordinary word, "
-        f"or the words only sound like it (fuzzy, with a 0-100 similarity score)."
+        f"or the words only sound like it (fuzzy, with a 0-100 similarity score). "
+        f"Every mention, held ones included, is in manifest.csv."
     )
     for name, m in first.items():
         more = counts[name] - 1
