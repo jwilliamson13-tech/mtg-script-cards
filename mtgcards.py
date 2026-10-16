@@ -6,6 +6,8 @@ Usage:
     python mtgcards.py transcript.txt --include "Hope" --include "thought seas"
     python mtgcards.py transcript.txt --nicknames my_nicknames.json
     python mtgcards.py transcript.txt --decklist faeries.txt --decklist devotion.txt
+    python mtgcards.py --audio episode.mp4                  # needs requirements-whisper.txt
+    python mtgcards.py --audio episode.mp4 --model large-v3 # bigger model, best on a GPU
     python mtgcards.py --refresh        # update the bundled card list from Scryfall
 """
 
@@ -23,6 +25,7 @@ import build_dictionary
 import decklist
 import matcher
 import scryfall
+import transcribe
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 CARDS_PATH = DATA_DIR / "cards.json"
@@ -35,10 +38,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="mtgcards",
         description="Find Magic cards in a transcript and download their images in order of first mention.",
     )
-    parser.add_argument("transcript", nargs="?", help="transcript file (.txt, .srt or .vtt)")
+    parser.add_argument(
+        "transcript", nargs="?", help="transcript file (.txt, .srt or .vtt); not needed with --audio"
+    )
     parser.add_argument(
         "--out",
-        help="output folder (default: <transcript name>_cards next to the transcript)",
+        help="output folder (default: <transcript or audio name>_cards next to the input)",
+    )
+    parser.add_argument(
+        "--audio",
+        metavar="FILE",
+        help="transcribe this video or audio file instead of reading a transcript "
+        "(needs the extra: pip install -r requirements-whisper.txt). The transcript is "
+        "saved as <name>.srt next to the output folder and reused on reruns",
+    )
+    parser.add_argument(
+        "--model",
+        default="small",
+        help="Whisper model for --audio: tiny, base, small (default), medium, large-v3, ... "
+        "Larger is more accurate and much slower without a GPU",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="where --audio runs the model (default: auto, the GPU if one works, else the CPU)",
+    )
+    parser.add_argument(
+        "--compute-type",
+        metavar="TYPE",
+        help="CTranslate2 compute type for --audio (default: int8, which works on any GPU or CPU)",
     )
     parser.add_argument(
         "--include",
@@ -68,8 +97,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="rebuild the bundled card list from Scryfall, then exit",
     )
     args = parser.parse_args(argv)
-    if not args.refresh and args.transcript is None:
-        parser.error("a transcript file is required unless --refresh is given")
+    if not args.refresh and args.transcript is None and args.audio is None:
+        parser.error("a transcript file (or --audio FILE) is required unless --refresh is given")
+    if args.transcript is not None and args.audio is not None:
+        parser.error("give a transcript file or --audio FILE, not both")
     return args
 
 
@@ -283,6 +314,59 @@ def load_decklists(
     return decklists
 
 
+def prompt_spellings(
+    names: list[str], cards: matcher.CardIndex, lookup: matcher.Lookup
+) -> list[str]:
+    """A decklist's names as the transcriber should spell them: the Oracle
+    name, or each face name of a multi-face card. Unknown names are left out."""
+    spellings = []
+    for name in names:
+        card = cards.get(name) or lookup.by_name.get(matcher.normalize(name))
+        if card is not None:
+            spellings += card.faces if len(card.faces) > 1 else [card.name]
+    return spellings
+
+
+def transcribe_audio(
+    audio: Path,
+    srt_path: Path,
+    decklists: list[list[str]],
+    cards: matcher.CardIndex,
+    lookup: matcher.Lookup,
+    args: argparse.Namespace,
+) -> bool:
+    """Make ``srt_path`` from ``audio`` unless an earlier run already did.
+    False (after a one-line message on stderr) when it could not."""
+    if srt_path.is_file():
+        print(
+            f"Using the transcript from an earlier run, {srt_path} "
+            "(delete it to transcribe again, e.g. with another --model).",
+            file=sys.stderr,
+        )
+        return True
+    names = transcribe.prompt_names(
+        [prompt_spellings(deck, cards, lookup) for deck in decklists]
+    )
+    try:
+        transcribe.transcribe(
+            audio,
+            srt_path,
+            model=args.model,
+            initial_prompt=names or None,
+            device=args.device,
+            compute_type=args.compute_type,
+        )
+    except transcribe.TranscriberMissing as exc:
+        print(exc, file=sys.stderr)
+        return False
+    except (RuntimeError, ValueError, OSError) as exc:
+        reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        print(f"Could not transcribe {audio}: {reason}", file=sys.stderr)
+        return False
+    print(f"Transcript saved: {srt_path}", file=sys.stderr)
+    return True
+
+
 def run(
     transcript_path: Path,
     out_dir: Path,
@@ -290,8 +374,10 @@ def run(
     argv: list[str],
     nicknames_path: str | None = None,
     decklist_paths: list[str] | None = None,
+    audio_args: argparse.Namespace | None = None,
 ) -> int:
-    text = transcript_path.read_text(encoding="utf-8-sig", errors="replace")
+    """Scan ``transcript_path`` and fill ``out_dir``. With ``audio_args``, the
+    transcript is first made from ``audio_args.audio`` if it does not exist."""
     cards = matcher.load_cards(CARDS_PATH)
     nicknames = load_nicknames(nicknames_path, cards)
     if nicknames is None:
@@ -300,6 +386,11 @@ def run(
     decklists = load_decklists(decklist_paths or [], cards, lookup)
     if decklists is None:
         return 2
+    if audio_args is not None and not transcribe_audio(
+        Path(audio_args.audio), transcript_path, decklists, cards, lookup, audio_args
+    ):
+        return 2
+    text = transcript_path.read_text(encoding="utf-8-sig", errors="replace")
 
     included: list[tuple[str, matcher.Card]] = []
     unresolved = 0
@@ -361,14 +452,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.refresh:
         build_dictionary.build(CARDS_PATH)
         return 0
-    transcript_path = Path(args.transcript)
-    if not transcript_path.is_file():
-        print(f"Transcript not found: {transcript_path}", file=sys.stderr)
+    source = Path(args.audio or args.transcript)
+    if not source.is_file():
+        what = "Audio file" if args.audio else "Transcript"
+        print(f"{what} not found: {source}", file=sys.stderr)
         return 2
     if args.out:
         out_dir = Path(args.out)
     else:
-        out_dir = transcript_path.with_name(f"{transcript_path.stem}_cards")
+        out_dir = source.with_name(f"{source.stem}_cards")
+    # With --audio the transcript is made next to the output folder.
+    transcript_path = out_dir.parent / f"{source.stem}.srt" if args.audio else source
     return run(
         transcript_path,
         out_dir,
@@ -376,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.argv[1:] if argv is None else argv,
         nicknames_path=args.nicknames,
         decklist_paths=args.decklist,
+        audio_args=args if args.audio else None,
     )
 
 
