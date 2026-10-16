@@ -19,15 +19,16 @@ USER_AGENT = f"mtg-script-cards/{VERSION}"
 API = "https://api.scryfall.com"
 
 MIN_GAP_SECONDS = 0.1
-# /cards/named (and /cards/search) are limited to 2 requests a second.
-NAMED_GAP_SECONDS = 0.5
+# /cards/named and /cards/search are limited to 2 requests a second; both go
+# through _wait_for_slow_gap, which spaces them by this much.
+SLOW_GAP_SECONDS = 0.5
 DEFAULT_TIMEOUT = 60
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
 
 _last_request_at = 0.0
-_last_named_at = float("-inf")
+_last_slow_at = float("-inf")
 
 
 def _wait_for_gap() -> None:
@@ -39,12 +40,13 @@ def _wait_for_gap() -> None:
     _last_request_at = time.monotonic()
 
 
-def _wait_for_named_gap() -> None:
-    global _last_named_at
-    remaining = NAMED_GAP_SECONDS - (time.monotonic() - _last_named_at)
+def _wait_for_slow_gap() -> None:
+    """Space /cards/named and /cards/search requests ``SLOW_GAP_SECONDS`` apart."""
+    global _last_slow_at
+    remaining = SLOW_GAP_SECONDS - (time.monotonic() - _last_slow_at)
     if remaining > 0:
         time.sleep(remaining)
-    _last_named_at = time.monotonic()
+    _last_slow_at = time.monotonic()
 
 
 def get(url: str, **kwargs) -> requests.Response:
@@ -87,7 +89,7 @@ def named_fuzzy(name: str) -> dict | None:
     least 500 ms apart, as Scryfall asks for this endpoint. The result can be a
     token (``"jace"``, ``"ragavan"``); check :func:`is_game_card` before using it.
     """
-    _wait_for_named_gap()
+    _wait_for_slow_gap()
     response = get(f"{API}/cards/named", params={"fuzzy": name})
     if response.status_code == 404:
         return None
@@ -112,10 +114,12 @@ def search(query: str, **params) -> Iterator[dict]:
     """Yield every card matching a Scryfall search, following pagination.
 
     A query that matches nothing yields nothing (Scryfall answers 404).
+    Pages are fetched at least 500 ms apart, as Scryfall asks for this endpoint.
     """
     url: str | None = f"{API}/cards/search"
     params = {"q": query, **params}
     while url:
+        _wait_for_slow_gap()
         response = get(url, params=params)
         params = {}
         if response.status_code == 404:
