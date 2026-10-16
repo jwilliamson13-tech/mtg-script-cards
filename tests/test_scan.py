@@ -562,3 +562,166 @@ def test_fuzzy_match_in_vtt_carries_the_cue_timestamp():
         ("Bitterblossom", "fuzzy", "00:00:35.760"),
         ("Cryptic Command", "exact", "00:00:37.360"),
     ]
+
+
+# --- decklists (#7) ----------------------------------------------------------
+
+DECK_CARDS = {
+    **FUZZY_CARDS,
+    **index_of(
+        "Snapcaster Mage",
+        "Mistbind Clique",
+        "Jace Beleren",
+        "Jace, Architect of Thought",
+        "Bident of Thassa",
+        "Aetherling",
+    ),
+}
+
+
+def described(result) -> list[tuple[str, str, bool]]:
+    return [(m.card.name, m.confidence, m.flagged) for m in result.mentions]
+
+
+def test_decklist_promotes_a_fuzzy_match_to_confident():
+    result = scan("a cloud finaptor to go", DECK_CARDS, decklists=[["Cloudfin Raptor"]])
+    [mention] = result.mentions
+    assert (mention.card.name, mention.confidence, mention.flagged) == (
+        "Cloudfin Raptor",
+        "decklist",
+        False,
+    )
+    assert 86 <= mention.score < 100
+    assert result.ordered_cards() == [DECK_CARDS["Cloudfin Raptor"]]
+
+
+def test_exact_and_nickname_mentions_of_a_decklist_card_are_decklist():
+    result = scan(
+        "cryptic now, cryptic command later",
+        DECK_CARDS,
+        decklists=[["Cryptic Command"]],
+        nicknames={"cryptic": "Cryptic Command"},
+    )
+    assert described(result) == [
+        ("Cryptic Command", "decklist", False),
+        ("Cryptic Command", "decklist", False),
+    ]
+
+
+def test_distinctive_single_word_matches_a_decklist_card():
+    # Nicknames off: the bundled file maps "snapcaster" too.
+    text = "then snapcaster flashes it back"
+    deck = [["Snapcaster Mage"]]
+    assert described(scan(text, DECK_CARDS, decklists=deck, nicknames={})) == [
+        ("Snapcaster Mage", "decklist", False)
+    ]
+    assert scan(text, DECK_CARDS, nicknames={}).mentions == []
+
+
+def test_card_outside_the_decklist_still_matches_with_its_normal_confidence():
+    result = scan(
+        "I hope you see the cryptic command",
+        DECK_CARDS,
+        decklists=[["Snapcaster Mage"]],
+        nicknames={},
+    )
+    assert described(result) == [
+        ("Hope", "exact", True),
+        ("Cryptic Command", "exact", False),
+    ]
+
+
+def test_misheard_decklist_card_below_the_fuzzy_threshold_is_found():
+    # Verbatim from the fixture transcript; "thought seas" scores 82, under 86.
+    text = "We got thought seas. All right."
+    assert scan(text, DECK_CARDS).mentions == []
+    result = scan(text, DECK_CARDS, decklists=[["Thoughtseize"]])
+    assert [(m.card.name, m.confidence, m.flagged, m.matched_text) for m in result.mentions] == [
+        ("Thoughtseize", "decklist", False, "thought seas")
+    ]
+
+
+def test_decklist_fuzzy_threshold_is_a_knob():
+    text = "We got thought seas. All right."
+    result = scan(text, DECK_CARDS, decklists=[["Thoughtseize"]], decklist_fuzzy_threshold=90)
+    assert result.mentions == []
+
+
+def test_decklist_fuzzy_reaches_a_card_through_a_distinctive_word():
+    # Verbatim from the fixture transcript. "through the" is not Thoughtseize.
+    text = "pump this big enough to get through the misbine click. I'm going to lose"
+    result = scan(text, DECK_CARDS, decklists=[["Mistbind Clique", "Thoughtseize"]])
+    assert described(result) == [("Mistbind Clique", "decklist", False)]
+
+
+def test_short_decklist_name_matches_one_misheard_word_only():
+    # Verbatim from the fixture transcript: the Bident of Thassa as heard.
+    text = "with the Biden and the island. Um, I"
+    result = scan(text, DECK_CARDS, decklists=[["Bident of Thassa"]])
+    assert described(result) == [
+        ("Bident of Thassa", "decklist", False),
+        ("Island", "exact", False),
+    ]
+    assert scan("this is an upgrade", DECK_CARDS, decklists=[["Island"]]).mentions == []
+
+
+def test_decklist_card_wins_over_a_real_card_spelled_with_a_space():
+    # Verbatim from the fixture transcript: "spell stutter" alone is the card
+    # Spell Stutter, but in a Faeries video it is Spellstutter Sprite.
+    text = ">> Uh, spell stutter. Okay, sure. And"
+    assert described(scan(text, DECK_CARDS)) == [("Spell Stutter", "exact", False)]
+    result = scan(text, DECK_CARDS, decklists=[["Spellstutter Sprite"]])
+    assert described(result) == [("Spellstutter Sprite", "decklist", False)]
+
+
+def test_word_shared_by_two_decklist_cards_matches_neither():
+    decklists = [["Jace Beleren"], ["Jace, Architect of Thought"]]
+    assert scan("then jace comes down", DECK_CARDS, decklists=decklists).mentions == []
+    assert described(scan("then beleren comes down", DECK_CARDS, decklists=decklists)) == [
+        ("Jace Beleren", "decklist", False)
+    ]
+
+
+def test_common_word_from_a_decklist_name_does_not_match():
+    # "clique" is in the bundled common-word list.
+    assert scan("what a clique", DECK_CARDS, decklists=[["Mistbind Clique"]]).mentions == []
+    # "mage" is too, when the list says so.
+    result = scan(
+        "the mage is good",
+        DECK_CARDS,
+        decklists=[["Snapcaster Mage"]],
+        common_words={"the", "is", "good", "mage"},
+    )
+    assert result.mentions == []
+
+
+def test_word_found_in_many_card_names_does_not_match():
+    # "mage" is not in the bundled word list, but it is in over a hundred card
+    # names: a speaker saying "mage" has not named Snapcaster Mage.
+    many_mages = index_of(*(f"Mage of {chr(97 + i) * 4}" for i in range(21)))
+    cards = {**DECK_CARDS, **many_mages}
+    assert scan("the mage is good", cards, decklists=[["Snapcaster Mage"]]).mentions == []
+    assert described(scan("the mage is good", DECK_CARDS, decklists=[["Snapcaster Mage"]])) == [
+        ("Snapcaster Mage", "decklist", False)
+    ]
+
+
+def test_decklist_never_filters_and_skips_unknown_names():
+    result = scan(
+        "thoughtseize into bitterblossom", DECK_CARDS, decklists=[["Not A Card", "Bitterblossom"]]
+    )
+    assert described(result) == [
+        ("Thoughtseize", "exact", False),
+        ("Bitterblossom", "decklist", False),
+    ]
+
+
+def test_one_decklist_may_be_given_as_a_flat_list_of_names():
+    result = scan("then snapcaster", DECK_CARDS, decklists=["Snapcaster Mage"])
+    assert described(result) == [("Snapcaster Mage", "decklist", False)]
+
+
+def test_fuzzy_window_never_swallows_a_nickname():
+    cards = index_of("Lightning Bolt", "Bolt Hound")
+    result = scan("bolt hand", cards, nicknames={"bolt": "Lightning Bolt"}, fuzzy_threshold=80)
+    assert described(result) == [("Lightning Bolt", "nickname", False)]

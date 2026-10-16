@@ -5,6 +5,7 @@ Usage:
     python mtgcards.py transcript.txt --out some/folder
     python mtgcards.py transcript.txt --include "Hope" --include "thought seas"
     python mtgcards.py transcript.txt --nicknames my_nicknames.json
+    python mtgcards.py transcript.txt --decklist faeries.txt --decklist devotion.txt
     python mtgcards.py --refresh        # update the bundled card list from Scryfall
 """
 
@@ -19,6 +20,7 @@ from pathlib import Path
 import requests
 
 import build_dictionary
+import decklist
 import matcher
 import scryfall
 
@@ -45,6 +47,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="NAME",
         help="download this card whether or not it was matched; repeatable, or comma-separated. "
         "Misspellings are resolved through Scryfall",
+    )
+    parser.add_argument(
+        "--decklist",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="a decklist as deck sites export it (\"4 Mistbind Clique\" per line); repeatable. "
+        "Its cards are matched with confidence, even misheard; other cards still match",
     )
     parser.add_argument(
         "--nicknames",
@@ -251,23 +261,49 @@ def load_nicknames(path: str | None, cards: matcher.CardIndex) -> dict[str, str]
     return nicknames
 
 
+def load_decklists(
+    paths: list[str], cards: matcher.CardIndex, lookup: matcher.Lookup
+) -> list[list[str]] | None:
+    """Each ``--decklist`` file's card names, with a warning on stderr for each
+    name that is no card (it is ignored). None if a file is unreadable."""
+    decklists = []
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+        except OSError as exc:
+            print(f"Could not read the decklist {path}: {exc.strerror or exc}", file=sys.stderr)
+            return None
+        names = decklist.parse_decklist(text)
+        for name in decklist.unknown_names(names, cards, lookup):
+            print(
+                f'{Path(path).name}: no card named "{name}" in the card list; ignored',
+                file=sys.stderr,
+            )
+        decklists.append(names)
+    return decklists
+
+
 def run(
     transcript_path: Path,
     out_dir: Path,
     include: list[str],
     argv: list[str],
     nicknames_path: str | None = None,
+    decklist_paths: list[str] | None = None,
 ) -> int:
     text = transcript_path.read_text(encoding="utf-8-sig", errors="replace")
     cards = matcher.load_cards(CARDS_PATH)
     nicknames = load_nicknames(nicknames_path, cards)
     if nicknames is None:
         return 2
+    lookup = matcher.build_lookup(cards)
+    decklists = load_decklists(decklist_paths or [], cards, lookup)
+    if decklists is None:
+        return 2
 
     included: list[tuple[str, matcher.Card]] = []
     unresolved = 0
     if include:
-        lookup = matcher.build_lookup(cards)
         for name in split_include_values(include, lookup):
             card, note = resolve_include(name, cards, lookup)
             if card is None:
@@ -278,7 +314,9 @@ def run(
                 print(f"--include: {note}")
             included.append((name, card))
 
-    result = matcher.scan(text, cards, nicknames=nicknames, include=included)
+    result = matcher.scan(
+        text, cards, nicknames=nicknames, include=included, decklists=decklists
+    )
     ordered = result.ordered_cards()
     numbers = {card.name: i for i, card in enumerate(ordered, start=1)}
 
@@ -337,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         args.include,
         sys.argv[1:] if argv is None else argv,
         nicknames_path=args.nicknames,
+        decklist_paths=args.decklist,
     )
 
 

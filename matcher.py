@@ -153,12 +153,14 @@ def normalize(text: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Lookup:
-    """Normalized name -> card, normalized nickname -> card, and the longest
-    key length in words across both."""
+    """Normalized name -> card, normalized nickname -> card, the longest key
+    length in words across both, and the decklist table (:func:`decklist_keys`):
+    space-stripped key -> decklist card."""
 
     by_name: dict[str, Card]
     max_words: int
     nicknames: dict[str, Card] = field(default_factory=dict)
+    decklist: dict[str, Card] = field(default_factory=dict)
 
 
 def build_lookup(
@@ -239,6 +241,105 @@ def nickname_warnings(nicknames: Mapping[str, str], cards: CardIndex) -> list[st
     return _resolve_nicknames(nicknames, cards.values(), build_lookup(cards).by_name)[1]
 
 
+# --- decklists -------------------------------------------------------------
+
+DECKLIST_MIN_WORD_CHARS = 3
+"""Shortest single word of a decklist card name that matches the card on its own."""
+DECKLIST_MAX_CARDS_PER_WORD = 20
+"""A word found in more card names than this (counting the whole card index) is
+Magic vocabulary rather than a name: "mage" (107 cards), "faerie" (38), "jace"
+(32), "scion" (29). "thassa" (12) and "ragavan" (2) still stand for a card."""
+DECKLIST_MAX_PIECES = 4
+"""Most transcript words the exact pass joins to find a decklist key ("snap caster")."""
+
+
+def _as_decklists(decklists: Iterable[Iterable[str]] | Iterable[str]) -> list[list[str]]:
+    """Accept a list of decklists, or one decklist given as a flat list of names."""
+    if isinstance(decklists, str):
+        return [[decklists]]
+    items = list(decklists)
+    if any(isinstance(item, str) for item in items):
+        return [[item for item in items if isinstance(item, str)]]
+    return [list(item) for item in items]
+
+
+def decklist_cards(
+    decklists: Iterable[Iterable[str]] | Iterable[str], cards: Mapping[str, Card], lookup: Lookup
+) -> dict[str, Card]:
+    """Every card named in ``decklists``, keyed by Oracle name, in list order.
+
+    A name is looked up as written, then normalized, so a face name or
+    lowercase works. Names that are no card are skipped here; the CLI warns
+    about them (``decklist.unknown_names``).
+    """
+    deck: dict[str, Card] = {}
+    for names in _as_decklists(decklists):
+        for name in names:
+            card = cards.get(name) or lookup.by_name.get(normalize(name))
+            if card is not None:
+                deck.setdefault(card.name, card)
+    return deck
+
+
+def distinctive_words(
+    deck: Iterable[Card], common_words: Collection[str], by_name: Mapping[str, Card] | None = None
+) -> dict[str, Card]:
+    """Normalized word -> card, for each word of a decklist card's name that
+    can stand for the card on its own: not a common English word, not a word
+    of another decklist card's name, at least ``DECKLIST_MIN_WORD_CHARS`` long,
+    not a number, and (when ``by_name``, the lookup over the whole card
+    index, is given) in at most ``DECKLIST_MAX_CARDS_PER_WORD`` card names.
+    "snapcaster" -> Snapcaster Mage, but not "mage" (107 cards), and not
+    "jace" when the lists hold two Jaces."""
+    owners: dict[str, set[str]] = {}
+    first: dict[str, Card] = {}
+    for card in deck:
+        for word in normalize(card.name).split():
+            owners.setdefault(word, set()).add(card.name)
+            first.setdefault(word, card)
+    words = {
+        word: first[word]
+        for word, names in owners.items()
+        if len(names) == 1
+        and word not in common_words
+        and len(word) >= DECKLIST_MIN_WORD_CHARS
+        and not word.isdigit()
+    }
+    if by_name:
+        named: dict[str, set[str]] = {word: set() for word in words}
+        for key, card in by_name.items():
+            for word in key.split():
+                if word in named:
+                    named[word].add(card.name)
+        words = {w: c for w, c in words.items() if len(named[w]) <= DECKLIST_MAX_CARDS_PER_WORD}
+    return words
+
+
+def decklist_keys(
+    deck: Iterable[Card], common_words: Collection[str], by_name: Mapping[str, Card] | None = None
+) -> dict[str, Card]:
+    """The exact pass's decklist table, keyed by space-stripped text.
+
+    Each decklist card's full name and face names with the spaces taken out,
+    when at least ``FUZZY_MIN_CHARS`` long, and its distinctive words
+    (:func:`distinctive_words`). The exact pass joins up to
+    ``DECKLIST_MAX_PIECES`` transcript words and looks the result up here, so
+    "spell stutter" is Spellstutter Sprite, "snap caster" is Snapcaster Mage
+    and "omen speaker" is Omenspeaker when those are in a list.
+    """
+    deck = list(deck)
+    table: dict[str, Card] = {}
+    for card in deck:
+        # A multi-face card by each face, never by the faces run together.
+        for name in card.faces if len(card.faces) > 1 else [card.name]:
+            key = normalize(name).replace(" ", "")
+            if len(key) >= FUZZY_MIN_CHARS:
+                table.setdefault(key, card)
+    for word, card in distinctive_words(deck, common_words, by_name).items():
+        table.setdefault(word, card)
+    return table
+
+
 # --- scan ------------------------------------------------------------------
 
 
@@ -286,6 +387,7 @@ def scan(
     nicknames=None,
     include: Sequence[Card | str | tuple[str, Card]] = (),
     fuzzy_threshold=86,
+    decklist_fuzzy_threshold=77,
     common_words: Collection[str] | None = None,
 ) -> ScanResult:
     """Find every card mentioned in ``transcript_text``.
@@ -324,15 +426,53 @@ def scan(
     timestamp and ``matched_text`` set to the include text (the Oracle name for
     a bare Card).
 
-    ``decklists`` is part of the seam for a later pass and is not used yet.
+    ``decklists`` is a sequence of decklists, each a sequence of Oracle names
+    (a face name or a lowercase name also works; names that are no card in
+    ``cards`` are skipped). Decklists boost matching and never filter it:
+    cards outside every list still match under the rules above. For a card in
+    any list:
+
+    - every mention of it, exact, nickname or fuzzy, carries
+      ``confidence="decklist"`` (keeping a fuzzy ``score``) and is confident;
+    - each distinctive word of its name (:func:`distinctive_words`) matches it
+      on its own in the exact pass: "snapcaster" -> Snapcaster Mage. Up to
+      ``DECKLIST_MAX_PIECES`` transcript words are also joined and compared
+      without spaces against those words and the card's names
+      (:func:`decklist_keys`), so "spell stutter" -> Spellstutter Sprite. At
+      the same number of words a decklist key beats a nickname, which beats
+      a real card name: the editor said which deck the video is about;
+    - the fuzzy pass also scores each window against the decklist cards'
+      names and distinctive words alone, at the lower
+      ``decklist_fuzzy_threshold``, so "thought seas" (82) -> Thoughtseize
+      and "misbinding" (78, against "mistbind") -> Mistbind Clique. A window
+      keeps whichever of its two hits scores higher, the decklist one on a
+      tie. The default of 77 was tuned on the fixture transcript with both of
+      its decklists (issue #7): at 72 "same thing" became Aetherling and
+      "Jace better" Jace Beleren; at 77 the only wrong hit left is
+      "thought I" as Thoughtseize, a card the video does show.
     """
     lookup = build_lookup(cards, bundled_nicknames() if nicknames is None else nicknames)
     common = bundled_common_words() if common_words is None else common_words
+    deck = decklist_cards(decklists, cards, lookup)
+    deck_names = None
+    if deck:
+        lookup = dataclasses.replace(
+            lookup,
+            decklist=decklist_keys(deck.values(), common, lookup.by_name),
+            max_words=max(lookup.max_words, DECKLIST_MAX_PIECES),
+        )
+        deck_names = FuzzyNames.for_decklist(deck.values(), lookup, decklist_fuzzy_threshold)
     fuzzy_names = FuzzyNames(lookup, fuzzy_threshold)
     mentions: list[Mention] = []
     for run in _runs(transcript.parse(transcript_text)):
         found = _exact_pass(run, lookup)
-        mentions.extend(_fuzzy_pass(run, found, fuzzy_names, common))
+        mentions.extend(_fuzzy_pass(run, found, fuzzy_names, common, deck_names, deck))
+    mentions = [
+        dataclasses.replace(m, confidence=DECKLIST)
+        if m.card.name in deck and m.confidence != DECKLIST
+        else m
+        for m in mentions
+    ]
     mentions = [_with_confidence_rule(m, common) for m in mentions]
     return ScanResult(_apply_includes(mentions, include, cards, lookup))
 
@@ -373,8 +513,11 @@ def _exact_pass(run: list[transcript.Segment], lookup: Lookup) -> list[Mention]:
     while i < len(tokens):
         for n in range(min(lookup.max_words, len(tokens) - i), 0, -1):
             key = " ".join(tokens[i : i + n])
-            # Same words: a nickname beats a real name (see scan's docstring).
-            card, confidence = lookup.nicknames.get(key), NICKNAME
+            # Same words: a decklist key beats a nickname beats a real name
+            # (see scan's docstring).
+            card, confidence = lookup.decklist.get(key.replace(" ", "")), DECKLIST
+            if card is None:
+                card, confidence = lookup.nicknames.get(key), NICKNAME
             if card is None:
                 card, confidence = lookup.by_name.get(key), EXACT
             if card is not None:
@@ -404,6 +547,10 @@ FUZZY_MIN_CHARS = 8
 """Shortest eligible card name, normalized and space-stripped. Shorter names
 ("Opt", "Hope", "Delay") are left to the exact pass: at that length one wrong
 letter is a different word."""
+DECKLIST_FUZZY_MIN_CHARS = 6
+"""Shortest decklist name or distinctive word the decklist fuzzy pass scores
+against: "Biden" -> Bident of Thassa. A name shorter than ``FUZZY_MIN_CHARS``
+is only taken for a single word with no digits ("is an" is not Island)."""
 FUZZY_MAX_WORDS = 4
 _ANNOTATION_RE = re.compile(r"\[[^\[\]]{1,40}\]")
 _BREAK_RE = re.compile(r">>|[.?!]")
@@ -420,14 +567,34 @@ class FuzzyNames:
     """
 
     def __init__(self, lookup: Lookup, threshold: float) -> None:
+        self._setup(lookup.by_name.items(), threshold, FUZZY_MIN_CHARS)
+
+    @classmethod
+    def for_decklist(cls, deck: Iterable[Card], lookup: Lookup, threshold: float) -> FuzzyNames:
+        """Only the decklist cards: their names and face names under the same
+        rules, plus their distinctive words (``lookup.decklist``), so
+        "misbinding" can reach Mistbind Clique through "mistbind". Names as
+        short as ``DECKLIST_FUZZY_MIN_CHARS`` take part."""
+        entries: list[tuple[str, Card]] = []
+        for card in deck:
+            names = dict.fromkeys([card.name, *card.faces])
+            entries.extend((normalize(name), card) for name in names)
+        entries.extend(lookup.decklist.items())
+        fuzzy_names = cls.__new__(cls)
+        fuzzy_names._setup(entries, threshold, DECKLIST_FUZZY_MIN_CHARS)
+        return fuzzy_names
+
+    def _setup(
+        self, entries: Iterable[tuple[str, Card]], threshold: float, min_chars: int
+    ) -> None:
         self.threshold = threshold
         by_length: dict[int, list[tuple[str, Card]]] = {}
         seen: set[str] = set()
-        for key, card in lookup.by_name.items():
+        for key, card in entries:
             if len(card.faces) > 1 and key == normalize(card.name):
                 continue
             stripped = key.replace(" ", "")
-            if len(stripped) < FUZZY_MIN_CHARS or stripped in seen:
+            if len(stripped) < min_chars or stripped in seen:
                 continue
             seen.add(stripped)
             by_length.setdefault(len(stripped), []).append((stripped, card))
@@ -501,6 +668,8 @@ def _fuzzy_pass(
     found: list[Mention],
     names: FuzzyNames,
     common_words: Collection[str],
+    deck_names: FuzzyNames | None = None,
+    deck: Collection[str] = (),
 ) -> list[Mention]:
     """Add fuzzy mentions to the exact mentions ``found`` in ``run``; return
     all of them in order of appearance.
@@ -528,8 +697,15 @@ def _fuzzy_pass(
        longer fuzzy mention then replaces the exact one. This is how
        "spell stutter sprite" becomes Spellstutter Sprite although the exact
        pass already took "spell stutter" as the card Spell Stutter, and
-       "omen speaker" becomes Omenspeaker rather than Omen.
+       "omen speaker" becomes Omenspeaker rather than Omen. A nickname or
+       decklist match, or a match of a card named in ``deck``, is never
+       replaced: a window may not touch it at all.
     4. A window keeps its best name if that scores at least the threshold.
+       With ``deck_names`` (the decklist cards, at their own lower
+       threshold) it keeps the better of the two hits, the decklist hit on a
+       tie, and a decklist hit carries ``confidence="decklist"``. A decklist
+       name shorter than ``FUZZY_MIN_CHARS`` counts only for a one-word
+       window of letters alone.
     5. Overlapping windows are settled best score first; at equal score the
        longer window wins, then the earlier one. So "bitter blossom" (100)
        beats "bitter blossom to" (93), and a window that only reaches the
@@ -575,7 +751,11 @@ def _fuzzy_pass(
         for k in range(len(words) - 1)
     ]
 
-    candidates: list[tuple[float, int, int, Card]] = []  # (score, start, end, card)
+    protected = [
+        m.confidence in (NICKNAME, DECKLIST) or m.card.name in deck for m in found
+    ]
+    # (score, start, end, card, confidence)
+    candidates: list[tuple[float, int, int, Card, str]] = []
     for i in range(len(tokens)):
         for j in range(i + 1, min(i + FUZZY_MAX_WORDS, len(tokens)) + 1):
             if noise[j - 1] or (j - 1 > i and breaks[j - 2]):
@@ -585,14 +765,28 @@ def _fuzzy_pass(
             inside = {owner[x] for x in range(i, j) if owner[x] is not None}
             if len(inside) > 1:
                 break
-            exact = span[inside.pop()] if inside else None
+            k = inside.pop() if inside else None
+            if k is not None and protected[k]:
+                break  # touches a match no window may replace
+            exact = span[k] if k is not None else None
             if exact is not None:
                 lo, hi = exact
                 if lo < i:
                     break  # starts inside an exact match
                 if hi > j or (lo, hi) == (i, j):
                     continue  # ends inside it, or is exactly it
-            hit = names.best("".join(tokens[i:j]))
+            query = "".join(tokens[i:j])
+            hit, confidence = names.best(query), FUZZY
+            if deck_names is not None:
+                deck_hit = deck_names.best(query)
+                if (
+                    deck_hit is not None
+                    and len(deck_hit[0]) < FUZZY_MIN_CHARS
+                    and (j > i + 1 or not query.isalpha())
+                ):
+                    deck_hit = None
+                if deck_hit is not None and (hit is None or deck_hit[2] >= hit[2]):
+                    hit, confidence = deck_hit, DECKLIST
             if hit is None:
                 continue
             name, card, score = hit
@@ -600,13 +794,13 @@ def _fuzzy_pass(
                 piece = "".join(tokens[exact[0] : exact[1]])
                 if piece not in name or len(piece) == len(name):
                     continue
-            candidates.append((score, i, j, card))
+            candidates.append((score, i, j, card, confidence))
 
     candidates.sort(key=lambda c: (-c[0], -(c[2] - c[1]), c[1]))
     taken = [False] * len(tokens)
     fuzzy: list[tuple[int, Mention]] = []
     absorbed: set[int] = set()
-    for score, i, j, card in candidates:
+    for score, i, j, card, confidence in candidates:
         if any(taken[i:j]):
             continue
         for x in range(i, j):
@@ -619,7 +813,7 @@ def _fuzzy_pass(
             card=card,
             matched_text=text[words[i][1] : words[j - 1][2]],
             timestamp=starts[i],
-            confidence=FUZZY,
+            confidence=confidence,
             flagged=False,
             context=" ".join(text[lo:hi].split()),
             score=score,
