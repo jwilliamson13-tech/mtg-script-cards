@@ -12,6 +12,14 @@ GTX 10 series) have no float16, and int8 is the fast choice on a CPU.
 Decoding: ``beam_size=5`` (Whisper's own default; greedy decoding mishears more
 names) and ``vad_filter=True`` (skips silence and music, where Whisper is prone
 to inventing text and looping).
+
+The decklist prompt is Whisper's ``initial_prompt``. Each 30 s window is
+conditioned on the 223 tokens before it, so the prompt steers only about the
+first minute; on the fixture episode that is where the correct spellings
+(Bitterblossom, Faeries) appear. faster-whisper's ``hotwords`` would repeat it
+in every window, but on a 10-minute fixture clip it dropped 5-11% of the words
+(one variant lost every "Master of Waves") for no gain in confident cards,
+because the decklist matcher already recovers misheard names.
 """
 
 from __future__ import annotations
