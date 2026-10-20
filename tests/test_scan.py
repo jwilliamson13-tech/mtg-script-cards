@@ -1,4 +1,4 @@
-"""Behaviour of the ``scan`` seam: which cards come out, in what order, how confident."""
+"""Behavior of the ``scan`` seam: which cards come out, in what order, how confident."""
 
 import builtins
 import io

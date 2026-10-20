@@ -753,7 +753,7 @@ def _fuzzy_pass(
     5. Overlapping windows are settled best score first; at equal score the
        longer window wins, then the earlier one. So "bitter blossom" (100)
        beats "bitter blossom to" (93), and a window that only reaches the
-       threshold by borrowing a neighbour's letters loses to a cleaner one.
+       threshold by borrowing a neighbor's letters loses to a cleaner one.
 
     Exact mentions are found again in the word stream by their words, in
     order: the exact pass consumes left to right, so the first occurrence of a

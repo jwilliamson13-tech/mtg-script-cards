@@ -89,7 +89,7 @@ Sideboard
 2 Flashfreeze
 ```
 
-A name the tool doesn't recognise gets a warning and is skipped.
+A name the tool doesn't recognize gets a warning and is skipped.
 
 What a decklist changes:
 
@@ -179,9 +179,9 @@ This downloads Scryfall's card file (about 25 MB), asks Scryfall which cards wer
 - If a card drops out on a rerun (for example after you remove a decklist), its old image stays in the folder.
 - No YouTube links. Download the captions yourself first.
 
-## Credits and licence
+## Credits and license
 
-The tool is released under the MIT licence (see `LICENSE`).
+The tool is released under the MIT license (see `LICENSE`).
 
 Card data and images come from [Scryfall](https://scryfall.com), which provides them free of charge for community projects. Scryfall's API documentation and data guidelines are at [scryfall.com/docs/api](https://scryfall.com/docs/api). The tool identifies itself to Scryfall as `mtg-script-cards/0.1.0` and spaces its requests as Scryfall asks. `data/cards.json` is built from Scryfall data.
 
